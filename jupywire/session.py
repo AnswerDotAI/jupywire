@@ -11,12 +11,11 @@ guard. Socket-facing `send`/`recv` live with the transports (kernmini's `MiniSes
 the websocket JSON/binary helpers below are the frame layer jupygate's channel protocol uses.
 """
 
-import hashlib, hmac, json, numbers, os, uuid
+import hashlib, hmac, json, numbers, os, struct, uuid
 from binascii import b2a_base64
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
 from fastcore.basics import xdumps, revive_dates
-from fastcore.nbio import pack_frames, unpack_frames
 
 
 DELIM = b"<IDS|MSG>"
@@ -160,6 +159,21 @@ def loads(s: str):
         for k in ("header", "parent_header"):
             if isinstance(msg.get(k), dict): msg[k] = revive_dates(msg[k])
     return msg
+
+
+def pack_frames(body:bytes, buffers=())->bytes:
+    "Pack `body` and binary `buffers` into a legacy Jupyter websocket binary frame"
+    parts = [body, *(bytes(b) for b in buffers)]
+    offs = [4*(len(parts)+1)]
+    for p in parts[:-1]: offs.append(offs[-1]+len(p))
+    return b''.join([struct.pack(f'!{len(parts)+1}I', len(parts), *offs), *parts])
+
+def unpack_frames(bmsg:bytes)->tuple:
+    "Split a legacy Jupyter websocket binary frame into `(body, buffers)`"
+    n = struct.unpack('!I', bmsg[:4])[0]
+    offs = [*struct.unpack(f'!{n}I', bmsg[4:4*(n+1)]), None]
+    parts = [bmsg[a:b] for a,b in zip(offs[:-1], offs[1:])]
+    return parts[0], parts[1:]
 
 
 def serialize_binary_message(msg):

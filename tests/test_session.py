@@ -1,5 +1,5 @@
 "Wire-format tests, cross-verified against jupyter_client (dev dep): same bytes, same signatures, same errors."
-import json, os, stat
+import json, os, stat, struct
 from datetime import datetime, timezone, date
 
 import pytest
@@ -61,7 +61,10 @@ def test_binary_message_roundtrip():
     s = Session(key=KEY)
     msg = s.msg("display_data", dict(data={"text/plain": "hi"}))
     msg["buffers"] = [b"bufone", b"buftwo"]
-    got = deserialize_binary_message(serialize_binary_message(msg))
+    frame = serialize_binary_message(msg)
+    n = struct.unpack("!I", frame[:4])[0]
+    assert n == 3  # body + two buffers: the legacy Jupyter websocket layout is part count, offset table, then parts
+    got = deserialize_binary_message(frame)
     assert got["content"] == msg["content"]
     assert [bytes(b) for b in got["buffers"]] == [b"bufone", b"buftwo"]
     assert loads(dumps(s.msg("status", dict(execution_state="idle"))))["content"]["execution_state"] == "idle"
