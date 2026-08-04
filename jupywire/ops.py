@@ -1,0 +1,91 @@
+"""Client-side call conventions for a Jupyter kernel: `eval`, `ipy`, and friends over one abstract `reply` seam.
+
+`EvalOps` is a mixin for kernel clients (conkernelclient's `ConKernelClient`, jupyasyncclient's
+`JupyAsyncKernelClient`): the inheritor supplies `reply(code, user_expressions=, timeout=,
+priority=, **kw)` awaiting its transport's `execute_reply` message, and gets the whole calling
+surface: `eval` (call a kernel-side function by name, result reconstructed by repr), `ipy`
+(`get_ipython()` methods), the generated `ipyfuncs` service methods, `xpush`/`retr`/`xenv`.
+`priority=` routes via a dedicated subshell: only hosts that create one set `self.priority`, and
+`reply` implementations assert otherwise. `_pre_ipy` is a liveness hook (default no-op).
+"""
+
+import asyncio
+from ast import literal_eval
+from fastcore.utils import rtoken_hex, nested_idx
+from fastcore.ansi import strip_ansi
+from fastcore.nbio import preferred_out
+
+class EvalException(Exception): pass
+
+_prims = str, int, float, complex, bool, tuple, list, dict, set, frozenset
+
+def try_eval(s, typ:str|None=None):
+    "Like `literal_eval`, but wraps in dynamic class named `typ` if succeeds, and returns `s` if fails"
+    try:
+        res = literal_eval(s)
+        if typ and isinstance(res, _prims): res = type(typ, (type(res),), {})(res)
+        return res
+    except: return s
+
+
+class EvalOps:
+    "Kernel-client calling conventions over the inheritor's `reply`: see the module docstring."
+    priority = None   # a subshell id for out-of-band evals; only hosts that create one (e.g. solveit) set it
+
+    def reply(self, code, user_expressions=None, timeout=None, priority=False, **kw):
+        "The transport seam: run `code`, returning an awaitable of the `execute_reply` message."
+        raise NotImplementedError
+
+    def _pre_ipy(self): pass   # liveness hook: transports may raise their dead-kernel error here
+
+    async def eval(self, func:str, *args, _timeout=60, _literal=True, _priority=False, _call=True, _msg_id=None, **kw):
+        "Result of running `func(*args, **kw)`"
+        if _priority: assert self.priority, 'no priority subshell configured'
+        vname = f'__{rtoken_hex(4)}'
+        if _call:
+            code = f'''import asyncio
+{vname} = {func}(*{args!r}, **{kw!r})
+if asyncio.iscoroutine({vname}): {vname} = await {vname}
+'''
+        else: code = f'{vname} = {func}'
+        exprs = dict(__res=vname, __typ=f"type({vname}).__name__", __del=f"globals().pop('{vname}', None)")
+        kw2 = dict(user_expressions=exprs, timeout=_timeout, store_history=False, priority=_priority)
+        if _msg_id is not None: kw2['msg_id'] = _msg_id
+        try: cts = (await self.reply(code, **kw2))['content']
+        except TimeoutError: return 'timeout'
+        except TypeError as e: raise EvalException(f"Eval failed: {e}")  # e.g. kernel not running
+        if cts['status']!='ok': return strip_ansi('\n'.join(cts.get('traceback', ['err'])))
+        typ = nested_idx(cts, 'user_expressions', '__typ', 'data', 'text/plain')
+        if typ: typ = typ.strip("'")
+        res = nested_idx(cts, 'user_expressions', '__res', 'data')
+        if not res: return res
+        res = preferred_out(res, html1st=False)[1]
+        try: return try_eval(res, typ) if _literal else res
+        except Exception as e: return str(e)
+
+    async def ipy(self, meth, *args, priority=False, timeout=5, **kwargs):
+        if not hasattr(self, '_ipylock'): self._ipylock = asyncio.Lock()
+        self._pre_ipy()
+        async with self._ipylock: return await self.eval('get_ipython().'+meth, _priority=priority, _timeout=timeout, *args, **kwargs)
+
+    async def xpush(self, priority=False, **kwargs): await self.reply(f'get_ipython().push({kwargs!r})', priority=priority)
+
+    async def retr(self, nm:str, priority=False):
+        "Retrieve a single variable value"
+        return await self.eval(nm, _call=False, _priority=priority, _timeout=60)
+
+    async def xenv(self, priority=False, **kw):
+        "Put all of `kw` in os.environ"
+        code = 'import os as __os\n'
+        code += '\n'.join(f'__os.environ[{k!r}]={str(v)!r}' for k,v in kw.items())
+        return await self.reply(code, priority=priority)
+
+
+def _mk_ipy(meth):
+    async def f(self, *args, priority=False, **kwargs): return await self.ipy(meth, *args, priority=priority, **kwargs)
+    f.__name__ = meth
+    setattr(EvalOps, meth, f)
+
+_ipy_funcs = ['user_items', 'get_vars', 'eval_exprs', 'get_schemas', 'publish', 'ranked_complete', 'sig_help']
+for o in _ipy_funcs: _mk_ipy(o)
+

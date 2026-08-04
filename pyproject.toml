@@ -22,6 +22,8 @@ dev = [
   "fastship",
   "build",
   "twine",
+  "pytest",
+  "jupyter_client>=8.0",
 ]
 
 [project.urls]
