@@ -1,10 +1,13 @@
-"""Client-side call conventions for a Jupyter kernel: `eval`, `ipy`, and friends over one abstract `reply` seam.
+"""Client-side call conventions for a Jupyter kernel: `eval`, `ipy`, and friends over two abstract transport seams.
 
 `EvalOps` is a mixin for kernel clients (conkernelclient's `ConKernelClient`, jupyasyncclient's
 `JupyAsyncKernelClient`): the inheritor supplies `reply(code, user_expressions=, timeout=,
-priority=, **kw)` awaiting its transport's `execute_reply` message, and gets the whole calling
-surface: `eval` (call a kernel-side function by name, result reconstructed by repr), `ipy`
-(`get_ipython()` methods), the generated `ipyfuncs` service methods, `xpush`/`retr`/`xenv`.
+priority=, **kw)` awaiting its transport's `execute_reply` message, and `execute(code, **kw)`
+sending without awaiting anything. It gets the whole calling surface: `eval` (call a kernel-side
+function by name, result reconstructed by repr), `ipy` (`get_ipython()` methods), the generated
+`ipyfuncs` service methods, `retr`, and the sync `xpush`/`xenv`. Setting names in a kernel has no
+useful reply, so those two are sync and fire-and-forget; ordering still holds, because a transport
+delivers requests in send order.
 `priority=` routes via a dedicated subshell: only hosts that create one set `self.priority`, and
 `reply` implementations assert otherwise. `_pre_ipy` is a liveness hook (default no-op).
 """
@@ -29,11 +32,15 @@ def try_eval(s, typ:str|None=None):
 
 
 class EvalOps:
-    "Kernel-client calling conventions over the inheritor's `reply`: see the module docstring."
+    "Kernel-client calling conventions over the inheritor's `reply` and `execute`: see the module docstring."
     priority = None   # a subshell id for out-of-band evals; only hosts that create one (e.g. solveit) set it
 
     def reply(self, code, user_expressions=None, timeout=None, priority=False, **kw):
-        "The transport seam: run `code`, returning an awaitable of the `execute_reply` message."
+        "The awaited transport seam: run `code`, returning an awaitable of the `execute_reply` message."
+        raise NotImplementedError
+
+    def execute(self, code, **kw):
+        "The fire-and-forget transport seam: send `code`, returning its msg_id, without awaiting a reply."
         raise NotImplementedError
 
     def _pre_ipy(self): pass   # liveness hook: transports may raise their dead-kernel error here
@@ -68,17 +75,19 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
         self._pre_ipy()
         async with self._ipylock: return await self.eval('get_ipython().'+meth, _priority=priority, _timeout=timeout, *args, **kwargs)
 
-    async def xpush(self, priority=False, **kwargs): await self.reply(f'get_ipython().push({kwargs!r})', priority=priority)
+    def xpush(self, **kwargs):
+        "Bind `kwargs` as names in the kernel's user namespace"
+        self.execute(f'get_ipython().push({kwargs!r})')
 
     async def retr(self, nm:str, priority=False):
         "Retrieve a single variable value"
         return await self.eval(nm, _call=False, _priority=priority, _timeout=60)
 
-    async def xenv(self, priority=False, **kw):
+    def xenv(self, **kw):
         "Put all of `kw` in os.environ"
         code = 'import os as __os\n'
         code += '\n'.join(f'__os.environ[{k!r}]={str(v)!r}' for k,v in kw.items())
-        return await self.reply(code, priority=priority)
+        self.execute(code)
 
 
 def _mk_ipy(meth):
