@@ -10,6 +10,8 @@ useful reply, so those two are sync and fire-and-forget; ordering still holds, b
 delivers requests in send order.
 `priority=` routes via a dedicated subshell: only hosts that create one set `self.priority`, and
 `reply` implementations assert otherwise. `_pre_ipy` is a liveness hook (default no-op).
+The module also carries the message-dict helpers shared by both clients' consumers: `parent_id`,
+`iopub_msgs`, and the `output_types` set.
 """
 
 import asyncio
@@ -29,6 +31,18 @@ def try_eval(s, typ:str|None=None):
         if typ and isinstance(res, _prims): res = type(typ, (type(res),), {})(res)
         return res
     except: return s
+
+
+output_types = {'stream', 'execute_result', 'display_data', 'error'}
+def parent_id(msg):
+    "The `msg_id` of the request this `msg` responds to, or None"
+    return nested_idx(msg, "parent_header", "msg_id") or None
+
+def iopub_msgs(msgs, msg_type=None):
+    "Filter iopub `msgs` by `msg_type` - a single type, or a collection of types (all messages if None)"
+    if msg_type is None: return msgs
+    types = {msg_type} if isinstance(msg_type, str) else msg_type
+    return [m for m in msgs if m['msg_type'] in types]
 
 
 class EvalOps:
