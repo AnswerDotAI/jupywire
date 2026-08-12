@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.3
+
+### New Features
+
+- Extract more ops ([#4](https://github.com/AnswerDotAI/jupywire/issues/4))
+
+
 ## 0.1.2
 
 ### New Features
