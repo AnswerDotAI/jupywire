@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.4
+
+### New Features
+
+- Replace priority subshell routing with kernmini priority:1 execute metadata; ipyfuncs default priority on, eval/retr off ([#5](https://github.com/AnswerDotAI/jupywire/issues/5))
+
+
 ## 0.1.3
 
 ### New Features
