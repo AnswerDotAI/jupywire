@@ -2,14 +2,17 @@
 
 `EvalOps` is a mixin for kernel clients (conkernelclient's `ConKernelClient`, jupyasyncclient's
 `JupyAsyncKernelClient`): the inheritor supplies `reply(code, user_expressions=, timeout=,
-priority=, **kw)` awaiting its transport's `execute_reply` message, and `execute(code, **kw)`
+**kw)` awaiting its transport's `execute_reply` message, and `execute(code, **kw)`
 sending without awaiting anything. It gets the whole calling surface: `eval` (call a kernel-side
 function by name, result reconstructed by repr), `ipy` (`get_ipython()` methods), the generated
 `ipyfuncs` service methods, `retr`, and the sync `xpush`/`xenv`. Setting names in a kernel has no
 useful reply, so those two are sync and fire-and-forget; ordering still holds, because a transport
 delivers requests in send order.
-`priority=` routes via a dedicated subshell: only hosts that create one set `self.priority`, and
-`reply` implementations assert otherwise. `_pre_ipy` is a liveness hook (default no-op).
+`priority=` sends kernmini's `priority: 1` execute metadata, so the request overtakes queued work
+(a held prompt turn, a Run-all's tail); a running request is never preempted, and kernels that do
+not know the key ignore it. The `ipyfuncs` service methods default it on, since each is a small
+out-of-band call made on the user's behalf; `eval` and `retr` run user code and default it off.
+`_pre_ipy` is a liveness hook (default no-op).
 The module also carries the message-dict helpers shared by both clients' consumers: `parent_id`,
 `iopub_msgs`, and the `output_types` set.
 """
@@ -47,9 +50,8 @@ def iopub_msgs(msgs, msg_type=None):
 
 class EvalOps:
     "Kernel-client calling conventions over the inheritor's `reply` and `execute`: see the module docstring."
-    priority = None   # a subshell id for out-of-band evals; only hosts that create one (e.g. solveit) set it
 
-    def reply(self, code, user_expressions=None, timeout=None, priority=False, **kw):
+    def reply(self, code, user_expressions=None, timeout=None, **kw):
         "The awaited transport seam: run `code`, returning an awaitable of the `execute_reply` message."
         raise NotImplementedError
 
@@ -61,7 +63,6 @@ class EvalOps:
 
     async def eval(self, func:str, *args, _timeout=60, _literal=True, _priority=False, _call=True, _msg_id=None, **kw):
         "Result of running `func(*args, **kw)`"
-        if _priority: assert self.priority, 'no priority subshell configured'
         vname = f'__{rtoken_hex(4)}'
         if _call:
             code = f'''import asyncio
@@ -70,7 +71,8 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
 '''
         else: code = f'{vname} = {func}'
         exprs = dict(__res=vname, __typ=f"type({vname}).__name__", __del=f"globals().pop('{vname}', None)")
-        kw2 = dict(user_expressions=exprs, timeout=_timeout, store_history=False, priority=_priority)
+        kw2 = dict(user_expressions=exprs, timeout=_timeout, store_history=False)
+        if _priority: kw2['metadata'] = dict(priority=1)
         if _msg_id is not None: kw2['msg_id'] = _msg_id
         try: cts = (await self.reply(code, **kw2))['content']
         except TimeoutError: return 'timeout'
@@ -84,7 +86,7 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
         try: return try_eval(res, typ) if _literal else res
         except Exception as e: return str(e)
 
-    async def ipy(self, meth, *args, priority=False, timeout=5, **kwargs):
+    async def ipy(self, meth, *args, priority=True, timeout=5, **kwargs):
         if not hasattr(self, '_ipylock'): self._ipylock = asyncio.Lock()
         self._pre_ipy()
         async with self._ipylock: return await self.eval('get_ipython().'+meth, _priority=priority, _timeout=timeout, *args, **kwargs)
@@ -105,7 +107,7 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
 
 
 def _mk_ipy(meth):
-    async def f(self, *args, priority=False, **kwargs): return await self.ipy(meth, *args, priority=priority, **kwargs)
+    async def f(self, *args, **kwargs): return await self.ipy(meth, *args, **kwargs)
     f.__name__ = meth
     setattr(EvalOps, meth, f)
 
