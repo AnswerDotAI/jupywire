@@ -77,7 +77,10 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
         try: cts = (await self.reply(code, **kw2))['content']
         except TimeoutError: return 'timeout'
         except TypeError as e: raise EvalException(f"Eval failed: {e}")  # e.g. kernel not running
-        if cts['status']!='ok': return strip_ansi('\n'.join(cts.get('traceback', ['err'])))
+        if cts['status']!='ok':
+            if tb := cts.get('traceback'): return strip_ansi('\n'.join(tb))
+            detail = ' '.join(filter(None, (cts.get('ename'), cts.get('evalue'))))
+            return f"{cts['status']}: {detail}" if detail else cts['status']
         typ = nested_idx(cts, 'user_expressions', '__typ', 'data', 'text/plain')
         if typ: typ = typ.strip("'")
         res = nested_idx(cts, 'user_expressions', '__res', 'data')
