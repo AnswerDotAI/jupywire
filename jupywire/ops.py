@@ -36,6 +36,15 @@ def try_eval(s, typ:str|None=None):
     except: return s
 
 
+class EvalError(Exception):
+    "An `eval_expr` expression raised in the kernel"
+
+def parse_expr(s):
+    "The `literal_eval` of `s` when its form allows, else `s` unchanged"
+    try: return literal_eval(s)
+    except Exception: return s
+
+
 output_types = {'stream', 'execute_result', 'display_data', 'error'}
 def parent_id(msg):
     "The `msg_id` of the request this `msg` responds to, or None"
@@ -101,6 +110,18 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
     async def retr(self, nm:str, priority=False):
         "Retrieve a single variable value"
         return await self.eval(nm, _call=False, _priority=priority, _timeout=60)
+
+    async def user_exprs(self, exprs:dict, code:str='', timeout=10, **kw):
+        "Run `code` and evaluate each of the `exprs` expressions in the same round trip; returns the reply content (statuses and mimebundles unparsed)"
+        return (await self.reply(code, user_expressions=exprs, timeout=timeout, store_history=False, **kw))['content']
+
+    async def eval_expr(self, expr:str, code:str='', timeout=10, **kw):
+        "Evaluate `expr` in the kernel (optionally after running `code`) and return its value: parsed via `literal_eval` when its repr allows, else the repr string. Raises `EvalError` if the kernel raises"
+        cts = await self.user_exprs({'_': expr}, code, timeout=timeout, **kw)
+        if cts['status'] != 'ok': raise EvalError(f"{cts.get('ename')}: {cts.get('evalue')}")
+        r = cts['user_expressions']['_']
+        if r.get('status') != 'ok': raise EvalError(f"{r.get('ename')}: {r.get('evalue')}")
+        return parse_expr(r['data']['text/plain'])
 
     def xenv(self, **kw):
         "Put all of `kw` in os.environ"

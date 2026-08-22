@@ -7,7 +7,7 @@ name = "jupywire"
 dynamic = ["version"]
 description = "Minimal Jupyter protocol commons: wire-format sessions and kernel-client call conventions"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = [
@@ -23,8 +23,12 @@ dev = [
   "build",
   "twine",
   "pytest",
+  "pytest-asyncio",
   "jupyter_client>=8.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/jupywire"
