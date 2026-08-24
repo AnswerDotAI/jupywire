@@ -3,25 +3,28 @@
 `RouterOps` is a mixin for kernel clients (conkernelclient's `ConKernelClient`, jupyasyncclient's
 `JupyAsyncKernelClient`). The transport feeds every inbound message to `route`. A shell or control
 message whose parent msg_id has a `reply()` or `request` future resolves it. A message parented to
-a `run()` in flight is collected by that run. Every other message goes to the app's `on_jmsg`
-callback, and an app that sets no callback drops them. `reply()` sends at call time and returns an
-awaitable of the `execute_reply`. `run()` sends when awaited and returns every parented shell,
-control, and iopub message, up to and including the `execute_reply` and the idle status. `request`
-sends any named protocol request, `shell` and `control` name its channel, and the typed verbs
-(`complete`, `inspect`, `check`, `history`) sit on top. `input` answers the most recent
-`input_request`, which `route` remembers. A dead-kernel status fails every waiter through
+a `run()` in flight is collected by that run; its stdin request goes to that run's `on_stdin` hook,
+whose return value jupywire sends as the correctly parented `input_reply`.
+Every other message goes to the app's `on_jmsg` callback, and an app that sets no callback drops
+them. `reply()` sends at call time and returns an awaitable of the `execute_reply`. `run()` sends
+when awaited and returns every parented shell, control, and iopub message, up to and including the
+`execute_reply` and the idle status. It disables stdin unless supplied an `on_stdin` hook.
+`request` sends any named protocol request, `shell` and `control` name its channel, and the typed
+verbs (`complete`, `inspect`, `check`, `history`) sit on top. `input` answers an explicit
+`input_request`, or the most recent unmatched request that `route` remembers. A dead-kernel status fails every waiter through
 `_kernel_died`; transport-loss and close paths call `fail_waiters` directly. `JmsgQueues` is the
 pull adapter: it registers itself as `on_jmsg` (and `kc.jmsgq`) and serves per-channel queues.
 
 The inheritor supplies `execute(code, msg_id=, ...)` sending without awaiting, `send(msg, channel)`
 transmitting a built message dict (including its `buffers`), a `session` building messages and
-fresh ids, and a read loop feeding `route` with `channel`-stamped dicts (awaiting `route`'s result
-when it is awaitable, so an async `on_jmsg` preserves arrival order).
+fresh ids, and a read loop feeding `route` with `channel`-stamped dicts. It awaits an awaitable
+returned by `route`, while stdin callbacks run in their own tasks so the read loop remains live.
 """
 
-import asyncio
+import asyncio, contextvars, inspect
 from queue import Empty
 from fastcore.nbio import msg2out
+from fastcore.utils import dict2obj
 
 OUTPUT_MSGS = ('stream', 'display_data', 'execute_result', 'error')
 COMM_MSGS = ('comm_open', 'comm_msg', 'comm_close')
@@ -33,20 +36,25 @@ class RouterOps:
     "Message handling over a transport that calls `route(msg)`: `reply()`, `run()`, named requests, stdin, and death."
     def _init_router(self):
         self.replies = {}    # msg_id -> future resolved with the matching shell/control reply
-        self.runs = {}       # msg_id -> [msgs, fut, got_reply, got_idle, on_output]
+        self.runs = {}       # msg_id -> run state
         self.on_jmsg = None
         self._last_stdin_req = None
 
     def route(self, msg):
-        "Deliver one inbound message; returns `on_jmsg`'s result, which the read loop awaits when awaitable."
+        "Deliver one inbound message; `on_jmsg` may return an awaitable, while stdin callbacks run independently."
         msg.setdefault('msg_id', msg.get('header', {}).get('msg_id'))
         msg.setdefault('msg_type', msg.get('header', {}).get('msg_type'))
         msg.setdefault('buffers', [])
         if msg['msg_type'] == 'status' and msg.get('content', {}).get('execution_state') == 'dead': return self._kernel_died(msg)
+        parent = msg.get('parent_header', {}).get('msg_id')
         if msg.get('channel') == 'stdin':
             self._last_stdin_req = msg.get('header')
+            if (r := self.runs.get(parent)) is not None and r.on_stdin is not None:
+                task = asyncio.create_task(self._answer_stdin(r, msg), context=r.stdin_context.copy())
+                r.stdin_tasks.add(task)
+                task.add_done_callback(r.stdin_tasks.discard)
+                return
             return self._jmsg(msg)
-        parent = msg.get('parent_header', {}).get('msg_id')
         if (r := self.runs.get(parent)) is not None: return self._run_msg(parent, r, msg)
         if msg.get('channel') in ('shell', 'control'):   # only a real reply may resolve a future, never the request's own iopub
             if (fut := self.replies.pop(parent, None)) is not None and not fut.done(): return fut.set_result(msg)
@@ -55,24 +63,38 @@ class RouterOps:
     def _jmsg(self, msg):
         if self.on_jmsg is not None: return self.on_jmsg(msg)
 
+    async def _answer_stdin(self, r, msg):
+        "Call this run's stdin handler and send its answer to the requesting kernel."
+        try:
+            value = r.on_stdin(msg)
+            if inspect.isawaitable(value): value = await value
+            self.input(value, msg)
+        except Exception as e:
+            r['error'] = e
+            try: await self.control('interrupt_request')
+            except Exception:
+                if not r.fut.done(): r.fut.set_exception(e)
+
     def _run_msg(self, parent, r, msg):
         "Fold one message into its run: collect, stream, complete on reply plus idle."
-        msgs, fut, _, _, on_output = r
-        msgs.append(msg)
-        if on_output is not None: on_output(msg)
+        r.msgs.append(msg)
+        if r.on_output is not None: r.on_output(msg)
         mt = msg['msg_type']
-        if mt == 'execute_reply': r[2] = True
-        if mt == 'status' and msg['content'].get('execution_state') == 'idle': r[3] = True
-        if r[2] and r[3]:
+        if mt == 'execute_reply': r['got_reply'] = True
+        if mt == 'status' and msg['content'].get('execution_state') == 'idle': r['got_idle'] = True
+        if r.got_reply and r.got_idle:
             self.runs.pop(parent)
-            if not fut.done(): fut.set_result(msgs)
+            if not r.fut.done():
+                if r.error is None: r.fut.set_result(r.msgs)
+                else: r.fut.set_exception(r.error)
 
     def fail_waiters(self, exc):
         "Fail every `reply()` future and in-flight `run()`: kernel death, transport loss, client close."
         for fut in self.replies.values():
             if not fut.done(): fut.set_exception(exc)
-        for _, fut, *_ in self.runs.values():
-            if not fut.done(): fut.set_exception(exc)
+        for r in self.runs.values():
+            if not r.fut.done(): r.fut.set_exception(exc)
+            for task in r.stdin_tasks: task.cancel()
         self.replies.clear()
         self.runs.clear()
 
@@ -125,24 +147,28 @@ class RouterOps:
         "Send a named control request, e.g. `control('interrupt_request')`."
         return self.request(name, content, 'control', timeout=timeout)
 
-    async def run(self, code, on_output=None, timeout=None, msg_id=None, **kw):
+    async def run(self, code, on_output=None, on_stdin=None, timeout=None, msg_id=None, **kw):
         "Every message parented to this execute, up to and including its `execute_reply` and idle status; sends when awaited."
         mid = msg_id or self.new_msg_id()
         if timeout is None: timeout = getattr(self, 'default_timeout', None)
         fut = asyncio.get_running_loop().create_future()
-        self.runs[mid] = [[], fut, False, False, on_output]
+        r = self.runs[mid] = dict2obj(msgs=[], fut=fut, got_reply=False, got_idle=False, on_output=on_output,
+            on_stdin=on_stdin, stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context())
         try:
-            self.execute(code, msg_id=mid, **kw)
+            self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
             return await asyncio.wait_for(fut, timeout)
-        finally: self.runs.pop(mid, None)
+        finally:
+            self.runs.pop(mid, None)
+            for task in r.stdin_tasks: task.cancel()
 
     async def exec_outs(self, code, **kw):
         "Just the rendered nbformat outputs of running `code`."
         return [msg2out(m) for m in await self.run(code, **kw) if m['msg_type'] in OUTPUT_MSGS]
 
-    def input(self, string):
-        "Answer the most recent `input_request`, parented to it; each prompt takes exactly one answer."
-        parent, self._last_stdin_req = self._last_stdin_req, None
+    def input(self, string, request=None):
+        "Answer an `input_request`; defaults to the most recent unmatched request."
+        parent = request.get('header') if request is not None else self._last_stdin_req
+        if parent == self._last_stdin_req: self._last_stdin_req = None
         self.send(self.session.msg('input_reply', dict(value=string), parent=parent), 'stdin')
 
     async def complete(self, code, cursor_pos=None, timeout=15):

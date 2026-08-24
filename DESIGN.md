@@ -59,22 +59,25 @@ The `done()` guard exists because `set_result` raises `InvalidStateError` on a f
 
 Tool calls need a third pattern. Most tools run as silent executes, where ipyai's `KernelBridge` sends the tool call with `reply()` and reads the result back through `user_expressions`. The `py` tool cannot, because its result is whatever the code printed or displayed, and those arrive as iopub messages. The same need appears in clikernel, teleprint, and test helpers. Each runs one piece of code and wants its outputs back.
 
-`run(code)` returns a list of the messages parented to its execute, up to and including the `execute_reply` and the idle status:
+`run(code)` returns a list of the messages parented to its execute, up to and including the `execute_reply` and the idle status. Optional hooks receive output and stdin traffic as it arrives:
 
 ```python
-async def run(self, code, timeout=None, msg_id=None, **kw):
+async def run(self, code, on_output=None, on_stdin=None, timeout=None, msg_id=None, **kw):
     mid = msg_id or self.new_msg_id()
     fut = asyncio.get_running_loop().create_future()
-    self.runs[mid] = [[], fut, False, False]      # msgs, fut, got_reply, got_idle
+    r = self.runs[mid] = dict2obj(msgs=[], fut=fut, got_reply=False, got_idle=False, on_output=on_output,
+        on_stdin=on_stdin, stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context())
     try:
-        self.execute(code, msg_id=mid, **kw)
+        self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
         return await asyncio.wait_for(fut, timeout)
-    finally: self.runs.pop(mid, None)
+    finally:
+        self.runs.pop(mid, None)
+        for task in r.stdin_tasks: task.cancel()
 ```
 
-`self.runs` maps msg_id to `[msgs, fut, got_reply, got_idle]`. `route()` appends every parented message to `msgs`, from shell, control, and iopub alike. stdin is the one exception, and its section below states why. The two booleans track completion. The reply is the last shell message of a request. Idle is the last iopub message. The reply and the idle status travel on different channels, and nothing orders delivery across channels, so completion requires both.
+Each run entry names its state: collected `msgs`, completion `fut`, `got_reply`, `got_idle`, the two callbacks, the active `stdin_tasks`, any stdin callback `error`, and the caller's `stdin_context`. `dict2obj` keeps reads legible (`r.fut`, `r.msgs`); mutations retain item assignment because its attribute form is read-only. `_run_msg` appends parented shell, control, and iopub messages. stdin is a routing event and is never collected as output. Completion requires both the shell reply and the idle status because channels do not share an ordering guarantee.
 
-`run()` is an `async def` and sends only when awaited. An unawaited `run()` sends nothing and files nothing. This differs from `reply()` because no `run()` caller separates send time from collect time. Concurrent tool calls compose with `asyncio.gather`. Each call has its own entry, so concurrent runs collect independently. There is no lock. No run can see another run's messages.
+`run()` is an `async def` and sends only when awaited. An unawaited `run()` sends nothing and files nothing. Concurrent calls have independent entries and collect independently. stdin is disabled unless the caller supplies `on_stdin`, binding permission to the handler that can actually service it.
 
 `route()` grows one branch, pulled out as a helper:
 
@@ -87,15 +90,16 @@ def route(self, msg):
     self.on_jmsg(msg)
 
 def _run_msg(self, parent, r, msg):
-    "Fold one message into its run(): collect, complete on reply plus idle"
-    msgs, fut, _, _ = r
-    msgs.append(msg)
+    r.msgs.append(msg)
+    if r.on_output is not None: r.on_output(msg)
     mt = msg['msg_type']
-    if mt == 'execute_reply': r[2] = True
-    if mt == 'status' and msg['content'].get('execution_state') == 'idle': r[3] = True
-    if r[2] and r[3]:
+    if mt == 'execute_reply': r['got_reply'] = True
+    if mt == 'status' and msg['content'].get('execution_state') == 'idle': r['got_idle'] = True
+    if r.got_reply and r.got_idle:
         self.runs.pop(parent)
-        if not fut.done(): fut.set_result(msgs)
+        if not r.fut.done():
+            if r.error is None: r.fut.set_result(r.msgs)
+            else: r.fut.set_exception(r.error)
 ```
 
 `route()` pops the entry as it resolves, so a message parented to a finished run flows to `on_jmsg` like any other unmatched message. Output printed by a background thread after idle reaches the app rather than a dead entry.
@@ -129,8 +133,9 @@ def _kernel_died(self, msg):
     exc = DeadKernelError('kernel died')
     for fut in self.replies.values():
         if not fut.done(): fut.set_exception(exc)
-    for _, fut, *_ in self.runs.values():
-        if not fut.done(): fut.set_exception(exc)
+    for r in self.runs.values():
+        if not r.fut.done(): r.fut.set_exception(exc)
+        for task in r.stdin_tasks: task.cancel()
     self.replies.clear()
     self.runs.clear()
     return self.on_jmsg(msg)
@@ -152,63 +157,69 @@ The typed verbs `complete`, `inspect`, `check`, and `history` remain, written on
 
 Comms are the one shell-channel send outside this pattern. A comm message never gets a reply, so `comm_open` and `comm_msg` build their messages and send them through `send(msg, channel)` without filing anything, returning the msg_id. Inbound comm traffic follows the general routing. A comm message parented to a `run()` is collected by that run. Any other comm message reaches `on_jmsg`.
 
-## on_output
+## run hooks
 
-A streaming consumer wants each message as it arrives rather than a list at the end. clikernel's `stream.py` emits an event per output. `run(code, on_output=cb)` serves it. The entry grows a fifth slot, and `_run_msg` passes each message to `cb` as it appends it. The collected contract is unchanged.
+A streaming consumer wants each message as it arrives rather than a list at the end. clikernel's `stream.py` emits an event per output. `run(code, on_output=cb)` serves it: `_run_msg` passes each collected message to `cb` as it appends it, without changing the collected result.
 
-We considered a queue in place of the callback and rejected it. A queue reader needs its own termination signal. `run()` would have to hand out the queue before completion. The death path would have to push exceptions into queues as well as futures. The callback has none of those obligations.
+`on_stdin` is not merely a notification. It receives an `input_request` parented to the run and returns that prompt's answer, either directly or through an awaitable. jupywire sends the resulting `input_reply`, correctly parented to the request. A caller describes the interaction in one straight-line callback; it does not manage a second queue, a continuation loop, or prompt lifecycle state.
 
 ## stdin
 
 When running code calls `input()`, the kernel sends an `input_request` on the stdin channel and blocks until the client answers. That request is the channel's entire inbound traffic. The reply direction belongs to the client, so `route()` never sees an `input_reply`.
 
-The full exchange, for a cell that prompts:
+`run()` owns stdin for executions it owns. Its `on_stdin` hook receives the complete `input_request`, just as `on_output` receives complete output messages. Supplying the hook sets `allow_stdin=True`; omitting it sets `allow_stdin=False`, so a noninteractive collected run gets `StdinNotImplementedError` rather than hanging.
 
 ```python
-# 1. A cell runs, stdin permitted:
-kc.execute("name = input('who? ')", msg_id='cell1.ab12', allow_stdin=True)
+async def answer(req):
+    return await ui.prompt(req['content']['prompt'])
 
-# 2. The kernel reaches input(), blocks, and sends on stdin:
-{'channel': 'stdin', 'msg_type': 'input_request',
- 'parent_header': {'msg_id': 'cell1.ab12'}, 'content': {'prompt': 'who? ', 'password': False}}
-
-# 3. route() stores the header and hands the message to on_jmsg, where the app shows the prompt:
-if msg.get('channel') == 'stdin':
-    self._last_stdin_req = msg['header']
-    return self.on_jmsg(msg)
-
-# 4. The app calls kc.input('Jeremy'), which answers on stdin, parented to the stored request:
-def input(self, string):
-    parent, self._last_stdin_req = self._last_stdin_req, None
-    self.send(self.session.msg('input_reply', dict(value=string), parent=parent), 'stdin')
-
-# 5. The kernel's input() unblocks, returns 'Jeremy', and the cell runs on to idle as usual.
+msgs = await kc.run("name = input('who? ')", on_stdin=answer)
 ```
 
-The stdin branch sits after the death check and before the `runs` match, so an `input_request` reaches `on_jmsg` even when its execute is a `run()`. `run()` therefore collects every parented shell, control, and iopub message, and no stdin message. One handler answers prompts for `execute()` and `run()` alike.
+The callback may wait as long as the user does, but `route()` must not. The same receive loop has to keep routing control replies and kernel-death signals while the callback is suspended. The stdin branch therefore starts one task for the exchange and returns immediately. That task runs in a copy of the context captured by `run()`, not the transport reader's context; request-scoped `ContextVar` values therefore remain attached to the callback that registered them. `_answer_stdin` awaits the callback when necessary, then calls `input(value, request)` with the complete request so concurrent runs cannot cross-parent their replies.
 
-The protocol assumes one outstanding request, because the kernel blocks until the answer arrives. `_last_stdin_req` is a single slot for the same reason. `input()` clears the slot as it answers, so each prompt takes exactly one answer.
+An stdin request parented to a run with a hook goes only to that hook. An unmatched request—for example one caused by fire-and-forget `execute()`—goes to `on_jmsg`, preserving the application-level cell path. stdin messages are routing events, not execution outputs, so `run()` never includes them in its returned message list.
+
+Each run records its active stdin tasks. Completion, cancellation, client close, and kernel death cancel them. If a callback raises, `_answer_stdin` records the error and sends `interrupt_request`; the kernel is not left blocked forever in `input()`. The run raises that error only after its execute has reached reply and idle, so a caller may safely execute again immediately. This is also why queues are the wrong primitive here: they require separate readers, termination sentinels, exception propagation, and continuation state for a request/reply exchange that is already exactly represented by a callable.
+
+`input(value, request)` remains public for unmatched application-level prompts and low-level clients. With an explicit request it parents the reply to that request. Without one it answers the most recent unmatched request remembered by `route()`.
 
 With every branch in place, the whole of `route()` is:
 
 ```python
 def route(self, msg):
     if msg['msg_type'] == 'status' and msg['content'].get('execution_state') == 'dead': return self._kernel_died(msg)
-    if msg.get('channel') == 'stdin':
-        self._last_stdin_req = msg['header']
-        return self.on_jmsg(msg)
     parent = msg.get('parent_header', {}).get('msg_id')
+    if msg.get('channel') == 'stdin':
+        self._last_stdin_req = msg.get('header')
+        if (r := self.runs.get(parent)) is not None and r.on_stdin is not None:
+            task = asyncio.create_task(self._answer_stdin(r, msg), context=r.stdin_context.copy())
+            r.stdin_tasks.add(task)
+            task.add_done_callback(r.stdin_tasks.discard)
+            return
+        return self._jmsg(msg)
     if (r := self.runs.get(parent)) is not None: return self._run_msg(parent, r, msg)
     if msg['channel'] in ('shell', 'control'):
         if (fut := self.replies.pop(parent, None)) is not None and not fut.done(): return fut.set_result(msg)
-    return self.on_jmsg(msg)
+    return self._jmsg(msg)
+
+async def _answer_stdin(self, r, msg):
+    try:
+        value = r.on_stdin(msg)
+        if inspect.isawaitable(value): value = await value
+        self.input(value, msg)
+    except Exception as e:
+        r['error'] = e
+        try: await self.control('interrupt_request')
+        except Exception:
+            if not r.fut.done(): r.fut.set_exception(e)
 ```
 
 ## on_jmsg and pulling
 
-`route()` passes every message not matched by `replies` or `runs` to `on_jmsg`: cell outputs and statuses, stdin requests, `cells` traffic, fire-and-forget replies, the dead status. An app that sets no callback drops them all, and dropping is the correct default, because nothing then accumulates unread. A handler must tolerate message types it does not use. Solveit's `process_jmsg` already does, because an `execute_reply` matches none of its branches and falls through.
+`route()` passes every message not matched by `replies`, `runs`, or a run's `on_stdin` hook to `on_jmsg`: cell outputs and statuses, unmatched stdin requests, `cells` traffic, fire-and-forget replies, and the dead status. An app that sets no callback drops them all, and dropping is the correct default, because nothing then accumulates unread. A handler must tolerate message types it does not use. Solveit's `process_jmsg` already does, because an `execute_reply` matches none of its branches and falls through.
 
-`on_jmsg` may be sync or async. When the handler returns an awaitable, `_pump` and `_recv_loop` await it before reading the next message, which preserves arrival order. A handler therefore stays a cheap dispatcher and hands heavy work onward. Solveit's and ipyai's handlers already have that form.
+`on_jmsg` may be sync or async. When the handler returns an awaitable, `_pump` and `_recv_loop` await it before reading the next message, which preserves arrival order. A handler therefore stays a cheap dispatcher and hands heavy work onward. `on_stdin` is deliberately different: `route()` schedules its exchange independently so waiting for human input never stops the receive loop. Solveit's and ipyai's application handlers already have the cheap-dispatcher form.
 
 Some consumers pull rather than accept calls. ipymini's protocol tests await the next iopub message directly. The pull form is a consumer of the push form, and `JmsgQueues` is that consumer. It holds one `asyncio.Queue` per configured channel, sets itself as the client's `on_jmsg` (and as `kc.jmsgq`, so helpers such as `iopub_drain` can find it), dispatches each message to its channel's queue through a merge map, and serves `get(channel, timeout=)`:
 

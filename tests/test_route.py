@@ -3,7 +3,7 @@
 Every client of `RouterOps` gets exactly these behaviors; the live-kernel notebooks in
 jupyasyncclient and conkernelclient demonstrate the same contracts over real transports.
 """
-import asyncio
+import asyncio, contextvars
 from queue import Empty
 
 import pytest
@@ -136,6 +136,7 @@ async def test_run_lifecycle():
     streamed = []
     task = asyncio.ensure_future(kc.run('x', on_output=streamed.append, msg_id='c.4'))
     await asyncio.sleep(0)
+    assert kc.sent[-1][2]['allow_stdin'] is False
     for m in _outs('c.4', 'live'): kc.route(m)
     assert [m['msg_type'] for m in streamed] == ['status', 'stream', 'status']   # streamed before completion
     kc.route(_reply('c.4'))
@@ -168,22 +169,45 @@ async def test_kernel_death_fails_everything():
     kc.fail_waiters(DeadKernelError('socket closed'))   # the transport-loss path needs no message
 
 
-async def test_stdin_slot_and_input():
+async def test_run_stdin_callback_answers_input():
     kc = FakeClient()
-    seen = _watch(kc)
-    task = asyncio.ensure_future(kc.run('x', msg_id='c.6', allow_stdin=True))
+    seen, prompts = _watch(kc), []
+    caller = contextvars.ContextVar('caller', default='transport')
+    async def on_stdin(msg):
+        await asyncio.sleep(0)
+        prompts.append((caller.get(), msg))
+        return 'Jeremy'
+    caller.set('run')
+    task = asyncio.ensure_future(kc.run('x', msg_id='c.6', on_stdin=on_stdin))
     await asyncio.sleep(0)
+    caller.set('transport')
+    assert kc.sent[-1][2]['allow_stdin'] is True
     req = _msg('input_request', 'c.6', channel='stdin', prompt='who? ')
-    kc.route(req)
-    assert seen == [req]                    # stdin bypasses the run
-    kc.input('Jeremy')
+    assert kc.route(req) is None
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert prompts == [('run', req)] and not seen
     ch, m = kc.sent_msgs[-1]
     assert (ch, m['content']) == ('stdin', dict(value='Jeremy'))
     assert m['parent_header']['msg_id'] == req['header']['msg_id']
-    assert kc._last_stdin_req is None       # answer-once
     for m2 in _outs('c.6'): kc.route(m2)
     kc.route(_reply('c.6'))
     assert not any(m2['msg_type'] == 'input_request' for m2 in await task)
+
+
+async def test_run_stdin_callback_failure_interrupts():
+    kc = FakeClient()
+    def fail(msg): raise ValueError('input refused')
+    task = asyncio.ensure_future(kc.run('x', msg_id='c.7', on_stdin=fail))
+    await asyncio.sleep(0)
+    kc.route(_msg('input_request', 'c.7', channel='stdin', prompt='secret? '))
+    await asyncio.sleep(0)
+    channel,msg = kc.sent_msgs[-1]
+    assert (channel, msg['header']['msg_type']) == ('control', 'interrupt_request')
+    kc.route(_msg('interrupt_reply', msg['header']['msg_id'], channel='control', status='ok'))
+    for m in _outs('c.7'): kc.route(m)
+    kc.route(_reply('c.7', status='error'))
+    with pytest.raises(ValueError, match='input refused'): await task
 
 
 async def test_async_on_jmsg_preserves_order():
