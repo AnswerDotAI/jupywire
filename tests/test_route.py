@@ -46,66 +46,58 @@ def _watch(kc):
     kc.on_jmsg = seen.append
     return seen
 
+async def _running(kc, code='x', **kw):
+    "Start `run` and yield once so its execute is registered and sent."
+    task = asyncio.create_task(kc.run(code, **kw))
+    await asyncio.sleep(0)
+    return task
 
-async def test_reply_resolution():
+
+async def test_reply_lifecycle():
+    "Replies correlate by parent id; iopub and late replies remain application traffic."
     kc = FakeClient()
+    seen = _watch(kc)
     w1, w2 = kc.reply('a'), kc.reply('b', msg_id='cell1.aa11')
-    assert kc.sent[1][0] == 'cell1.aa11'   # the caller's msg_id goes on the wire
+    first = kc.sent[0][0]
+    assert kc.sent[1][0] == 'cell1.aa11'
+
+    kc.route(_msg('status', first, execution_state='busy'))
+    kc.route(_msg('stream', first, name='stdout', text='out'))
     kc.route(_reply('cell1.aa11'))
-    kc.route(_reply(kc.sent[0][0]))
+    kc.route(_reply(first))
     r1, r2 = await w1, await w2
-    assert r1['parent_header']['msg_id'] == kc.sent[0][0]
+    assert r1['parent_header']['msg_id'] == first
     assert r2['parent_header']['msg_id'] == 'cell1.aa11'
-    assert not kc.replies
-
-
-async def test_reply_ignores_own_iopub():
-    "A reply()'s execute also causes iopub traffic; only the shell reply may resolve the future."
-    kc = FakeClient()
-    seen = _watch(kc)
-    w = kc.reply('a', msg_id='c.1')
-    kc.route(_msg('status', 'c.1', execution_state='busy'))
-    kc.route(_msg('stream', 'c.1', name='stdout', text='out'))
-    kc.route(_reply('c.1'))
-    assert (await w)['msg_type'] == 'execute_reply'
     assert [m['msg_type'] for m in seen] == ['status', 'stream']
+    assert not kc.replies
 
-
-async def test_reply_timeout_and_late_arrival():
-    kc = FakeClient()
-    seen = _watch(kc)
     w = kc.reply('slow', timeout=0.01)
+    slow = kc.sent[-1][0]
     with pytest.raises(TimeoutError): await w
-    assert not kc.replies                                # the timeout popped the entry
-    kc.route(_reply(kc.sent[0][0]))
-    assert seen[-1]['msg_type'] == 'execute_reply'       # the late reply reaches on_jmsg
+    assert not kc.replies
+    kc.route(_reply(slow))
+    assert seen[-1]['msg_type'] == 'execute_reply'
+
     kc.default_timeout = 0.01
-    with pytest.raises(TimeoutError): await kc.reply('slow again')   # a client-level default timeout applies when none is passed
+    with pytest.raises(TimeoutError): await kc.reply('slow again')
     assert not kc.replies
 
 
-async def test_run_collects_both_terminator_orders():
+async def test_run_completion_boundary():
+    "A run needs reply plus idle; once complete, stragglers return to application routing."
     kc = FakeClient()
-    for idle_first in (True, False):
-        task = asyncio.ensure_future(kc.run('x', msg_id='c.2'))
-        await asyncio.sleep(0)
-        outs = list(_outs('c.2', 'hi'))
-        for m in (outs + [_reply('c.2')]) if idle_first else ([_reply('c.2')] + outs): kc.route(m)
-        msgs = await asyncio.wait_for(task, 5)
+    seen = _watch(kc)
+    for i,idle_first in enumerate((True, False)):
+        mid = f'c.2.{i}'
+        task = await _running(kc, msg_id=mid)
+        outs = list(_outs(mid, 'hi'))
+        for msg in (outs + [_reply(mid)]) if idle_first else ([_reply(mid)] + outs): kc.route(msg)
+        msgs = await task
         assert len(msgs) == 4
         assert {m['msg_type'] for m in msgs} == {'status', 'stream', 'execute_reply'}
         assert not kc.runs
 
-
-async def test_run_straggler_reaches_on_jmsg():
-    kc = FakeClient()
-    seen = _watch(kc)
-    task = asyncio.ensure_future(kc.run('x', msg_id='c.3'))
-    await asyncio.sleep(0)
-    for m in _outs('c.3'): kc.route(m)
-    kc.route(_reply('c.3'))
-    await task
-    late = _msg('stream', 'c.3', name='stdout', text='from a background thread')
+    late = _msg('stream', mid, name='stdout', text='from a background thread')
     kc.route(late)
     assert seen == [late]
 
@@ -113,9 +105,8 @@ async def test_run_straggler_reaches_on_jmsg():
 async def test_runs_concurrent_and_isolated():
     kc = FakeClient()
     seen = _watch(kc)
-    t1 = asyncio.ensure_future(kc.run('a', msg_id='c1.x'))
-    t2 = asyncio.ensure_future(kc.run('b', msg_id='c2.y'))
-    await asyncio.sleep(0)
+    t1 = await _running(kc, 'a', msg_id='c1.x')
+    t2 = await _running(kc, 'b', msg_id='c2.y')
     for m in _outs('c2.y', 'two'): kc.route(m)
     for m in _outs('c1.x', 'one'): kc.route(m)
     kc.route(_msg('stream', 'foreign', name='stdout', text='NOT MINE'))
@@ -128,48 +119,64 @@ async def test_runs_concurrent_and_isolated():
     assert not kc.runs
 
 
-async def test_run_lifecycle():
+async def test_run_hooks_and_output_adapter():
+    "Runs send only when awaited, stream live messages, render outputs, and clean timeouts."
     kc = FakeClient()
     coro = kc.run('never')
-    assert not kc.sent and not kc.runs      # unawaited: nothing sent, nothing filed
+    assert not kc.sent and not kc.runs
     coro.close()
+
     streamed = []
-    task = asyncio.ensure_future(kc.run('x', on_output=streamed.append, msg_id='c.4'))
-    await asyncio.sleep(0)
+    task = await _running(kc, on_output=streamed.append, msg_id='c.4')
     assert kc.sent[-1][2]['allow_stdin'] is False
     for m in _outs('c.4', 'live'): kc.route(m)
-    assert [m['msg_type'] for m in streamed] == ['status', 'stream', 'status']   # streamed before completion
+    assert [m['msg_type'] for m in streamed] == ['status', 'stream', 'status']
     kc.route(_reply('c.4'))
     await task
-    with pytest.raises(TimeoutError): await kc.run('slow', timeout=0.01)
-    assert not kc.runs                      # the timeout cleaned its entry
 
-
-async def test_exec_outs():
-    kc = FakeClient()
-    task = asyncio.ensure_future(kc.exec_outs('x', msg_id='c.5'))
+    task = asyncio.create_task(kc.exec_outs('x', msg_id='c.5'))
     await asyncio.sleep(0)
     for m in _outs('c.5', 'hello'): kc.route(m)
     kc.route(_reply('c.5'))
     assert await task == [dict(output_type='stream', name='stdout', text='hello')]
 
+    with pytest.raises(TimeoutError): await kc.run('slow', timeout=0.01)
+    assert not kc.runs
 
-async def test_kernel_death_fails_everything():
+
+async def test_waiter_failure_cleanup():
+    "Kernel death, transport loss, and failed sends wake callers and leave no filed state."
     kc = FakeClient()
     seen = _watch(kc)
     w = kc.reply('a')
-    task = asyncio.ensure_future(kc.run('b'))
-    await asyncio.sleep(0)
+    task = await _running(kc, 'b')
     dead = dict(msg_type='status', channel='iopub', parent_header={}, header={}, content=dict(execution_state='dead'))
     kc.route(dead)
     with pytest.raises(DeadKernelError): await w
-    with pytest.raises(DeadKernelError): await asyncio.wait_for(task, 5)
-    assert seen[-1] is dead                 # the status still reaches the app
+    with pytest.raises(DeadKernelError): await task
+    assert seen[-1] is dead
     assert not kc.replies and not kc.runs
-    kc.fail_waiters(DeadKernelError('socket closed'))   # the transport-loss path needs no message
+
+    lost = FakeClient()
+    w = lost.reply('a')
+    task = await _running(lost, 'b')
+    lost.fail_waiters(RuntimeError('socket closed'))
+    with pytest.raises(RuntimeError, match='socket closed'): await w
+    with pytest.raises(RuntimeError, match='socket closed'): await task
+    assert not lost.replies and not lost.runs
+
+    class Broken(FakeClient):
+        def execute(self, code, **kw): raise OSError('socket closed')
+        def send(self, msg, channel): raise OSError('socket closed')
+    broken = Broken()
+    with pytest.raises(OSError): broken.reply('x')
+    with pytest.raises(OSError): await broken.run('x')
+    with pytest.raises(OSError): broken.request('kernel_info_request')
+    assert not broken.replies and not broken.runs
 
 
-async def test_run_stdin_callback_answers_input():
+async def test_run_stdin_callback_lifecycle():
+    "A callback answers in its caller context; a failed callback interrupts before raising."
     kc = FakeClient()
     seen, prompts = _watch(kc), []
     caller = contextvars.ContextVar('caller', default='transport')
@@ -178,8 +185,7 @@ async def test_run_stdin_callback_answers_input():
         prompts.append((caller.get(), msg))
         return 'Jeremy'
     caller.set('run')
-    task = asyncio.ensure_future(kc.run('x', msg_id='c.6', on_stdin=on_stdin))
-    await asyncio.sleep(0)
+    task = await _running(kc, msg_id='c.6', on_stdin=on_stdin)
     caller.set('transport')
     assert kc.sent[-1][2]['allow_stdin'] is True
     req = _msg('input_request', 'c.6', channel='stdin', prompt='who? ')
@@ -194,23 +200,21 @@ async def test_run_stdin_callback_answers_input():
     kc.route(_reply('c.6'))
     assert not any(m2['msg_type'] == 'input_request' for m2 in await task)
 
-
-async def test_run_stdin_callback_failure_interrupts():
-    kc = FakeClient()
     def fail(msg): raise ValueError('input refused')
-    task = asyncio.ensure_future(kc.run('x', msg_id='c.7', on_stdin=fail))
+    failed = FakeClient()
+    task = await _running(failed, msg_id='c.7', on_stdin=fail)
+    failed.route(_msg('input_request', 'c.7', channel='stdin', prompt='secret? '))
     await asyncio.sleep(0)
-    kc.route(_msg('input_request', 'c.7', channel='stdin', prompt='secret? '))
-    await asyncio.sleep(0)
-    channel,msg = kc.sent_msgs[-1]
+    channel,msg = failed.sent_msgs[-1]
     assert (channel, msg['header']['msg_type']) == ('control', 'interrupt_request')
-    kc.route(_msg('interrupt_reply', msg['header']['msg_id'], channel='control', status='ok'))
-    for m in _outs('c.7'): kc.route(m)
-    kc.route(_reply('c.7', status='error'))
+    failed.route(_msg('interrupt_reply', msg['header']['msg_id'], channel='control', status='ok'))
+    for m in _outs('c.7'): failed.route(m)
+    failed.route(_reply('c.7', status='error'))
     with pytest.raises(ValueError, match='input refused'): await task
 
 
-async def test_async_on_jmsg_preserves_order():
+async def test_unmatched_message_consumers():
+    "The push callback preserves order; `JmsgQueues` adapts the same route to pulling."
     kc = FakeClient()
     order = []
     async def handler(m):
@@ -221,6 +225,18 @@ async def test_async_on_jmsg_preserves_order():
         r = kc.route(_msg('stream', 'x', name='stdout', text=t))
         if r is not None: await r
     assert order == ['a', 'b', 'c']
+
+    pulled = FakeClient()
+    qs = JmsgQueues(pulled, queues=('shell', 'jmsg'), merge=dict(iopub='jmsg', stdin='jmsg'))
+    assert pulled.on_jmsg is qs and pulled.jmsgq is qs
+    pulled.route(_msg('stream', 'x', name='stdout', text='hi'))
+    pulled.route(_msg('input_request', 'x', channel='stdin', prompt='? '))
+    pulled.route(_reply('unclaimed'))
+    assert (await qs.get('jmsg', timeout=1))['msg_type'] == 'stream'
+    assert (await qs.jmsg_for('input_request', timeout=1))['msg_type'] == 'input_request'
+    assert (await qs.get_shell_msg(timeout=1))['msg_type'] == 'execute_reply'
+    pulled.route(dict(_msg('stream', 'x'), channel='unknown'))
+    with pytest.raises(Empty): await qs.get('jmsg', timeout=0.01)
 
 
 async def test_request_and_typed_verbs():
@@ -254,13 +270,6 @@ async def test_request_and_typed_verbs():
     answer('history_request', history=[[0, 1, 'x=1']])
     assert (await task)['content']['history'] == [[0, 1, 'x=1']]
 
-    mid = kc.comm_msg('co1', dict(x=1), buffers=[b'raw'])
-    ch, m = kc.sent_msgs[-1]
-    assert mid == m['header']['msg_id']
-    assert (ch, m['header']['msg_type'], m['content'], m['buffers']) == ('shell', 'comm_msg', dict(comm_id='co1', data=dict(x=1)), [b'raw'])
-    kc.comm_open('tgt', 'co1', dict(y=2))
-    assert kc.sent_msgs[-1][1]['content'] == dict(comm_id='co1', target_name='tgt', data=dict(y=2))
-
     w = kc.request('kernel_info_request', channel='control', msg_id='fixed-id-1')
     ch, m = kc.sent_msgs[-1]
     assert m['header']['msg_id'] == 'fixed-id-1'
@@ -268,28 +277,14 @@ async def test_request_and_typed_verbs():
     assert (await w)['parent_header']['msg_id'] == 'fixed-id-1'
 
 
-async def test_jmsg_queues():
+def test_comms_are_fire_and_forget():
     kc = FakeClient()
-    qs = JmsgQueues(kc, queues=('shell', 'jmsg'), merge=dict(iopub='jmsg', stdin='jmsg'))
-    assert kc.on_jmsg is qs and kc.jmsgq is qs
-    kc.route(_msg('stream', 'x', name='stdout', text='hi'))
-    kc.route(_msg('input_request', 'x', channel='stdin', prompt='? '))
-    kc.route(_reply('unclaimed'))
-    assert (await qs.get('jmsg', timeout=1))['msg_type'] == 'stream'
-    assert (await qs.jmsg_for('input_request', timeout=1))['msg_type'] == 'input_request'
-    assert (await qs.get_shell_msg(timeout=1))['msg_type'] == 'execute_reply'
-    kc.route(dict(_msg('stream', 'x'), channel='unknown'))   # a channel with no queue: dropped
-    with pytest.raises(Empty): await qs.get('jmsg', timeout=0.01)
+    mid = kc.comm_msg('co1', dict(x=1), buffers=[b'raw'])
+    ch, msg = kc.sent_msgs[-1]
+    assert mid == msg['header']['msg_id']
+    assert (ch, msg['header']['msg_type'], msg['content'], msg['buffers']) == (
+        'shell', 'comm_msg', dict(comm_id='co1', data=dict(x=1)), [b'raw'])
 
-
-async def test_send_failure_leaves_no_entry():
-    class Broken(FakeClient):
-        def execute(self, code, **kw): raise OSError('socket closed')
-        def send(self, msg, channel): raise OSError('socket closed')
-    kc = Broken()
-    with pytest.raises(OSError): kc.reply('x')
-    assert not kc.replies
-    with pytest.raises(OSError): await kc.run('x')
-    assert not kc.runs
-    with pytest.raises(OSError): kc.request('kernel_info_request')
+    kc.comm_open('tgt', 'co1', dict(y=2))
+    assert kc.sent_msgs[-1][1]['content'] == dict(comm_id='co1', target_name='tgt', data=dict(y=2))
     assert not kc.replies
