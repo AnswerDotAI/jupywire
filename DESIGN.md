@@ -43,12 +43,15 @@ def reply(self, code, timeout=None, msg_id=None, **kw):
 
 ```python
 def route(self, msg):
-    fut = self.replies.pop(msg.get('parent_header', {}).get('msg_id'), None)
-    if fut is not None and not fut.done(): fut.set_result(msg)
-    else: self.on_jmsg(msg)
+    if msg['channel'] in ('shell', 'control'):
+        fut = self.replies.pop(msg.get('parent_header', {}).get('msg_id'), None)
+        if fut is not None and not fut.done(): return fut.set_result(msg)
+    self.on_jmsg(msg)
 ```
 
-Two destinations. A message whose parent msg_id has a waiting future resolves it. Everything else goes to one app-supplied callback, `on_jmsg`. The name jmsg avoids collision with dialog messages. Solveit's `process_jmsg` is such a callback today. It reads the parent msg_id, splits at the dot, finds the cell, and folds the message into it.
+Two destinations. A shell or control message whose parent msg_id has a waiting future resolves it. Everything else goes to one app-supplied callback, `on_jmsg`. The name jmsg avoids collision with dialog messages. Solveit's `process_jmsg` is such a callback today. It reads the parent msg_id, splits at the dot, finds the cell, and folds the message into it.
+
+The channel guard matters, because the execute behind a `reply()` also causes iopub traffic parented to the same msg_id, and the busy status usually arrives before the reply. Only a shell or control message is a reply, so only those may resolve the future.
 
 The `done()` guard exists because `set_result` raises `InvalidStateError` on a future already cancelled by its timeout. A reply that arrives after its `reply()` timed out finds no entry, or finds a cancelled future, and flows to `on_jmsg` like any other unmatched message.
 
@@ -79,9 +82,9 @@ async def run(self, code, timeout=None, msg_id=None, **kw):
 def route(self, msg):
     parent = msg.get('parent_header', {}).get('msg_id')
     if (r := self.runs.get(parent)) is not None: return self._run_msg(parent, r, msg)
-    fut = self.replies.pop(parent, None)
-    if fut is not None and not fut.done(): fut.set_result(msg)
-    else: self.on_jmsg(msg)
+    if msg['channel'] in ('shell', 'control'):
+        if (fut := self.replies.pop(parent, None)) is not None and not fut.done(): return fut.set_result(msg)
+    self.on_jmsg(msg)
 
 def _run_msg(self, parent, r, msg):
     "Fold one message into its run(): collect, complete on reply plus idle"
@@ -135,7 +138,7 @@ def _kernel_died(self, msg):
 
 Every `reply()` and `run()` caller wakes holding `DeadKernelError`. The status then reaches `on_jmsg`, so the app can show the kernel as dead. No app polls for liveness.
 
-Over zmq there is no gateway, so the dead status never arrives on the wire. conkernelclient produces the status itself, from two signals. A `_pump` that hits a socket error has lost the transport. jupyter_client's `HBChannel` covers the kernel process itself. It echoes every `time_to_dead` seconds (default 1.0) and invokes `call_handlers(since_last_heartbeat)` when an echo goes unanswered. The kernel answers heartbeats from a dedicated thread, so a busy kernel still beats. Sustained silence on a local connection therefore means the kernel process has exited. conkernelclient declares death after three consecutive unanswered echoes rather than one, because a single missed echo can be scheduler noise. From either signal, conkernelclient builds the same dead `status` message rustygate broadcasts and passes it to `route()`. Death therefore reaches `route()` in one shape on both transports.
+Over zmq there is no gateway, so the dead status never arrives on the wire. conkernelclient produces the status itself, from two signals. A `_pump` that hits a socket error has lost the transport. jupyter_client's `HBChannel` covers the kernel process itself. It echoes every `time_to_dead` seconds (default 1.0) and reports the result in `is_beating()`. The kernel answers heartbeats from a dedicated thread, so a busy kernel still beats. Sustained silence on a local connection therefore means the kernel process has exited. conkernelclient declares death after three consecutive unanswered echoes rather than one, because a single missed echo can be scheduler noise. From either signal, conkernelclient builds the same dead `status` message rustygate broadcasts and passes it to `route()`. Death therefore reaches `route()` in one shape on both transports.
 
 Waiters also end at client close. jupyasyncclient's `aclose` and conkernelclient's `stop_channels` fail both dicts the same way, with a `RuntimeError` naming the close rather than `DeadKernelError`. jupyasyncclient's `_reconnect` fails them the same way when its retry ceiling expires.
 
@@ -147,7 +150,7 @@ One sender implements the pattern for all ten requests. It builds the named mess
 
 The typed verbs `complete`, `inspect`, `check`, and `history` remain, written once over `.shell()` with the reply's useful fields extracted.
 
-Comms are the one shell-channel send outside this pattern. A comm message never gets a reply, so `comm_msg` builds its message and sends it through `send(msg, channel)` without filing anything. Inbound comm traffic follows the general routing. A comm message parented to a `run()` is collected by that run. Any other comm message reaches `on_jmsg`.
+Comms are the one shell-channel send outside this pattern. A comm message never gets a reply, so `comm_open` and `comm_msg` build their messages and send them through `send(msg, channel)` without filing anything, returning the msg_id. Inbound comm traffic follows the general routing. A comm message parented to a `run()` is collected by that run. Any other comm message reaches `on_jmsg`.
 
 ## on_output
 
@@ -196,7 +199,8 @@ def route(self, msg):
         return self.on_jmsg(msg)
     parent = msg.get('parent_header', {}).get('msg_id')
     if (r := self.runs.get(parent)) is not None: return self._run_msg(parent, r, msg)
-    if (fut := self.replies.pop(parent, None)) is not None and not fut.done(): return fut.set_result(msg)
+    if msg['channel'] in ('shell', 'control'):
+        if (fut := self.replies.pop(parent, None)) is not None and not fut.done(): return fut.set_result(msg)
     return self.on_jmsg(msg)
 ```
 
@@ -206,7 +210,7 @@ def route(self, msg):
 
 `on_jmsg` may be sync or async. When the handler returns an awaitable, `_pump` and `_recv_loop` await it before reading the next message, which preserves arrival order. A handler therefore stays a cheap dispatcher and hands heavy work onward. Solveit's and ipyai's handlers already have that form.
 
-Some consumers pull rather than accept calls. ipymini's protocol tests await the next iopub message directly. The pull form is a consumer of the push form, and `JmsgQueues` is that consumer. It holds one `asyncio.Queue` per configured channel, sets itself as the client's `on_jmsg`, dispatches each message to its channel's queue through a merge map, and serves `get(channel, timeout=)`:
+Some consumers pull rather than accept calls. ipymini's protocol tests await the next iopub message directly. The pull form is a consumer of the push form, and `JmsgQueues` is that consumer. It holds one `asyncio.Queue` per configured channel, sets itself as the client's `on_jmsg` (and as `kc.jmsgq`, so helpers such as `iopub_drain` can find it), dispatches each message to its channel's queue through a merge map, and serves `get(channel, timeout=)`:
 
 ```python
 qs = JmsgQueues(kc, merge=dict(iopub='jmsg', stdin='jmsg'))

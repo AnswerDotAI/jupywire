@@ -1,4 +1,4 @@
-"""Conformance tests for the three-tier router and `Run`, driven by an in-memory fake transport.
+"""Conformance tests for `jupywire.route`: the DESIGN.md contract, driven by an in-memory fake transport.
 
 Every client of `RouterOps` gets exactly these behaviors; the live-kernel notebooks in
 jupyasyncclient and conkernelclient demonstrate the same contracts over real transports.
@@ -8,24 +8,23 @@ from queue import Empty
 
 import pytest
 
-from jupywire.route import RouterOps, Run, DeadKernelError
+from jupywire.route import RouterOps, JmsgQueues, DeadKernelError
 from jupywire.session import Session
 
 
 class FakeClient(RouterOps):
-    "A `RouterOps` inheritor whose `execute` records sends; tests deliver kernel traffic via `route`."
-    def __init__(self, **kw):
+    "A `RouterOps` inheritor whose `execute` and `send` record; tests deliver kernel traffic via `route`."
+    def __init__(self):
         self.session = Session(key=b'test')
-        self.sent, self.inputs, self.alive = [], [], True
-        self._init_router(**kw)
+        self.sent, self.sent_msgs = [], []
+        self._init_router()
 
     def execute(self, code, msg_id=None, **kw):
         msg_id = msg_id or self.new_msg_id()
         self.sent.append((msg_id, code, kw))
         return msg_id
 
-    async def is_alive(self): return self.alive
-    def input(self, string): self.inputs.append(string)
+    def send(self, msg, channel): self.sent_msgs.append((channel, msg))
 
 
 def _msg(mtype, parent, channel='iopub', **content):
@@ -41,154 +40,232 @@ def _outs(parent, *texts):
     for t in texts: yield _msg('stream', parent, name='stdout', text=t)
     yield _msg('status', parent, execution_state='idle')
 
+def _watch(kc):
+    "Attach a recording `on_jmsg`; returns the record list."
+    seen = []
+    kc.on_jmsg = seen.append
+    return seen
 
-async def test_reply_waiters_concurrent():
+
+async def test_reply_resolution():
     kc = FakeClient()
-    f1, f2 = kc._register_reply('m1'), kc._register_reply('m2')
-    kc.route(_reply('m2'))
-    kc.route(_reply('m1'))
-    r1 = await kc.await_reply(f1, 'm1', timeout=1)
-    r2 = await kc.await_reply(f2, 'm2', timeout=1)
-    assert (r1['parent_header']['msg_id'], r2['parent_header']['msg_id']) == ('m1', 'm2')
+    w1, w2 = kc.reply('a'), kc.reply('b', msg_id='cell1.aa11')
+    assert kc.sent[1][0] == 'cell1.aa11'   # the caller's msg_id goes on the wire
+    kc.route(_reply('cell1.aa11'))
+    kc.route(_reply(kc.sent[0][0]))
+    r1, r2 = await w1, await w2
+    assert r1['parent_header']['msg_id'] == kc.sent[0][0]
+    assert r2['parent_header']['msg_id'] == 'cell1.aa11'
+    assert not kc.replies
 
 
-async def test_stale_reply_dropped():
+async def test_reply_ignores_own_iopub():
+    "A reply()'s execute also causes iopub traffic; only the shell reply may resolve the future."
     kc = FakeClient()
-    fut = kc._register_reply('slow')
-    with pytest.raises(TimeoutError): await kc.await_reply(fut, 'slow', timeout=0.01)
-    kc.route(_reply('slow'))   # late arrival: swallowed, not queued
-    with pytest.raises(Empty): await kc.get_msg('shell', timeout=0.01)
+    seen = _watch(kc)
+    w = kc.reply('a', msg_id='c.1')
+    kc.route(_msg('status', 'c.1', execution_state='busy'))
+    kc.route(_msg('stream', 'c.1', name='stdout', text='out'))
+    kc.route(_reply('c.1'))
+    assert (await w)['msg_type'] == 'execute_reply'
+    assert [m['msg_type'] for m in seen] == ['status', 'stream']
 
 
-async def test_fail_pending_cascade():
+async def test_reply_timeout_and_late_arrival():
     kc = FakeClient()
-    bad = kc._register_reply('bad', fail_pending=True)
-    other = kc._register_reply('other')
-    kc.route(_reply('bad', status='error', ename='ValueError', evalue='boom'))
-    assert (await kc.await_reply(bad, 'bad', timeout=1))['content']['status'] == 'error'
-    with pytest.raises(RuntimeError, match='ValueError'): await kc.await_reply(other, 'other', timeout=1)
+    seen = _watch(kc)
+    w = kc.reply('slow', timeout=0.01)
+    with pytest.raises(TimeoutError): await w
+    assert not kc.replies                                # the timeout popped the entry
+    kc.route(_reply(kc.sent[0][0]))
+    assert seen[-1]['msg_type'] == 'execute_reply'       # the late reply reaches on_jmsg
+    kc.default_timeout = 0.01
+    with pytest.raises(TimeoutError): await kc.reply('slow again')   # a client-level default timeout applies when none is passed
+    assert not kc.replies
 
 
-async def test_channel_queues_and_merge():
-    kc = FakeClient(queues=('shell', 'control', 'jmsg'), merge=dict(iopub='jmsg', stdin='jmsg'))
+async def test_run_collects_both_terminator_orders():
+    kc = FakeClient()
+    for idle_first in (True, False):
+        task = asyncio.ensure_future(kc.run('x', msg_id='c.2'))
+        await asyncio.sleep(0)
+        outs = list(_outs('c.2', 'hi'))
+        for m in (outs + [_reply('c.2')]) if idle_first else ([_reply('c.2')] + outs): kc.route(m)
+        msgs = await asyncio.wait_for(task, 5)
+        assert len(msgs) == 4
+        assert {m['msg_type'] for m in msgs} == {'status', 'stream', 'execute_reply'}
+        assert not kc.runs
+
+
+async def test_run_straggler_reaches_on_jmsg():
+    kc = FakeClient()
+    seen = _watch(kc)
+    task = asyncio.ensure_future(kc.run('x', msg_id='c.3'))
+    await asyncio.sleep(0)
+    for m in _outs('c.3'): kc.route(m)
+    kc.route(_reply('c.3'))
+    await task
+    late = _msg('stream', 'c.3', name='stdout', text='from a background thread')
+    kc.route(late)
+    assert seen == [late]
+
+
+async def test_runs_concurrent_and_isolated():
+    kc = FakeClient()
+    seen = _watch(kc)
+    t1 = asyncio.ensure_future(kc.run('a', msg_id='c1.x'))
+    t2 = asyncio.ensure_future(kc.run('b', msg_id='c2.y'))
+    await asyncio.sleep(0)
+    for m in _outs('c2.y', 'two'): kc.route(m)
+    for m in _outs('c1.x', 'one'): kc.route(m)
+    kc.route(_msg('stream', 'foreign', name='stdout', text='NOT MINE'))
+    kc.route(_reply('c1.x'))
+    kc.route(_reply('c2.y'))
+    m1, m2 = await asyncio.gather(t1, t2)
+    assert [m['content']['text'] for m in m1 if m['msg_type'] == 'stream'] == ['one']
+    assert [m['content']['text'] for m in m2 if m['msg_type'] == 'stream'] == ['two']
+    assert seen[0]['content']['text'] == 'NOT MINE'
+    assert not kc.runs
+
+
+async def test_run_lifecycle():
+    kc = FakeClient()
+    coro = kc.run('never')
+    assert not kc.sent and not kc.runs      # unawaited: nothing sent, nothing filed
+    coro.close()
+    streamed = []
+    task = asyncio.ensure_future(kc.run('x', on_output=streamed.append, msg_id='c.4'))
+    await asyncio.sleep(0)
+    for m in _outs('c.4', 'live'): kc.route(m)
+    assert [m['msg_type'] for m in streamed] == ['status', 'stream', 'status']   # streamed before completion
+    kc.route(_reply('c.4'))
+    await task
+    with pytest.raises(TimeoutError): await kc.run('slow', timeout=0.01)
+    assert not kc.runs                      # the timeout cleaned its entry
+
+
+async def test_exec_outs():
+    kc = FakeClient()
+    task = asyncio.ensure_future(kc.exec_outs('x', msg_id='c.5'))
+    await asyncio.sleep(0)
+    for m in _outs('c.5', 'hello'): kc.route(m)
+    kc.route(_reply('c.5'))
+    assert await task == [dict(output_type='stream', name='stdout', text='hello')]
+
+
+async def test_kernel_death_fails_everything():
+    kc = FakeClient()
+    seen = _watch(kc)
+    w = kc.reply('a')
+    task = asyncio.ensure_future(kc.run('b'))
+    await asyncio.sleep(0)
+    dead = dict(msg_type='status', channel='iopub', parent_header={}, header={}, content=dict(execution_state='dead'))
+    kc.route(dead)
+    with pytest.raises(DeadKernelError): await w
+    with pytest.raises(DeadKernelError): await asyncio.wait_for(task, 5)
+    assert seen[-1] is dead                 # the status still reaches the app
+    assert not kc.replies and not kc.runs
+    kc.fail_waiters(DeadKernelError('socket closed'))   # the transport-loss path needs no message
+
+
+async def test_stdin_slot_and_input():
+    kc = FakeClient()
+    seen = _watch(kc)
+    task = asyncio.ensure_future(kc.run('x', msg_id='c.6', allow_stdin=True))
+    await asyncio.sleep(0)
+    req = _msg('input_request', 'c.6', channel='stdin', prompt='who? ')
+    kc.route(req)
+    assert seen == [req]                    # stdin bypasses the run
+    kc.input('Jeremy')
+    ch, m = kc.sent_msgs[-1]
+    assert (ch, m['content']) == ('stdin', dict(value='Jeremy'))
+    assert m['parent_header']['msg_id'] == req['header']['msg_id']
+    assert kc._last_stdin_req is None       # answer-once
+    for m2 in _outs('c.6'): kc.route(m2)
+    kc.route(_reply('c.6'))
+    assert not any(m2['msg_type'] == 'input_request' for m2 in await task)
+
+
+async def test_async_on_jmsg_preserves_order():
+    kc = FakeClient()
+    order = []
+    async def handler(m):
+        await asyncio.sleep(0)
+        order.append(m['content']['text'])
+    kc.on_jmsg = handler
+    for t in ('a', 'b', 'c'):
+        r = kc.route(_msg('stream', 'x', name='stdout', text=t))
+        if r is not None: await r
+    assert order == ['a', 'b', 'c']
+
+
+async def test_request_and_typed_verbs():
+    kc = FakeClient()
+    def answer(name, channel='shell', **content):
+        ch, m = kc.sent_msgs[-1]
+        assert (ch, m['header']['msg_type']) == (channel, name)
+        kc.route(dict(_msg(name.replace('_request', '_reply'), m['header']['msg_id'], channel=channel), content=content))
+    w = kc.control('interrupt_request')
+    answer('interrupt_request', 'control', status='ok')
+    assert (await w)['content']['status'] == 'ok'
+
+    task = asyncio.ensure_future(kc.complete('imp'))
+    await asyncio.sleep(0)
+    answer('complete_request', matches=['import'], cursor_start=0)
+    assert await task == (['import'], 0)
+
+    task = asyncio.ensure_future(kc.check('for i in x:'))
+    await asyncio.sleep(0)
+    answer('is_complete_request', status='incomplete', indent='    ')
+    assert await task == ('incomplete', '    ')
+
+    task = asyncio.ensure_future(kc.inspect('no_such'))
+    await asyncio.sleep(0)
+    answer('inspect_request', found=False)
+    assert await task == ''
+
+    task = asyncio.ensure_future(kc.history())
+    await asyncio.sleep(0)
+    assert kc.sent_msgs[-1][1]['content']['session'] == 0   # range access defaults filled in
+    answer('history_request', history=[[0, 1, 'x=1']])
+    assert (await task)['content']['history'] == [[0, 1, 'x=1']]
+
+    mid = kc.comm_msg('co1', dict(x=1), buffers=[b'raw'])
+    ch, m = kc.sent_msgs[-1]
+    assert mid == m['header']['msg_id']
+    assert (ch, m['header']['msg_type'], m['content'], m['buffers']) == ('shell', 'comm_msg', dict(comm_id='co1', data=dict(x=1)), [b'raw'])
+    kc.comm_open('tgt', 'co1', dict(y=2))
+    assert kc.sent_msgs[-1][1]['content'] == dict(comm_id='co1', target_name='tgt', data=dict(y=2))
+
+    w = kc.request('kernel_info_request', channel='control', msg_id='fixed-id-1')
+    ch, m = kc.sent_msgs[-1]
+    assert m['header']['msg_id'] == 'fixed-id-1'
+    kc.route(dict(_msg('kernel_info_reply', 'fixed-id-1', channel='control'), content=dict(status='ok')))
+    assert (await w)['parent_header']['msg_id'] == 'fixed-id-1'
+
+
+async def test_jmsg_queues():
+    kc = FakeClient()
+    qs = JmsgQueues(kc, queues=('shell', 'jmsg'), merge=dict(iopub='jmsg', stdin='jmsg'))
+    assert kc.on_jmsg is qs and kc.jmsgq is qs
     kc.route(_msg('stream', 'x', name='stdout', text='hi'))
     kc.route(_msg('input_request', 'x', channel='stdin', prompt='? '))
-    assert (await kc.get_msg('jmsg', timeout=1))['msg_type'] == 'stream'
-    assert (await kc.get_msg('jmsg', timeout=1))['msg_type'] == 'input_request'
-    assert kc._last_stdin_req is not None   # remembered for `input`
-    kc.route(dict(_msg('stream', 'x'), channel='unknown'))   # unmapped channel with no queue: dropped
-    with pytest.raises(Empty): await kc.get_msg('jmsg', timeout=0.01)
+    kc.route(_reply('unclaimed'))
+    assert (await qs.get('jmsg', timeout=1))['msg_type'] == 'stream'
+    assert (await qs.jmsg_for('input_request', timeout=1))['msg_type'] == 'input_request'
+    assert (await qs.get_shell_msg(timeout=1))['msg_type'] == 'execute_reply'
+    kc.route(dict(_msg('stream', 'x'), channel='unknown'))   # a channel with no queue: dropped
+    with pytest.raises(Empty): await qs.get('jmsg', timeout=0.01)
 
 
-async def test_concurrent_runs_isolated():
-    "The #15 contract: several runs in flight each collect only their own traffic, and the raw tier still sees the rest."
-    kc = FakeClient()
-    r1, r2 = Run(kc, 'a'), Run(kc, 'b')
-    for m in _outs(r2.msg_id, 'two'): kc.route(m)
-    for m in _outs(r1.msg_id, 'one'): kc.route(m)
-    kc.route(_msg('stream', 'foreign', name='stdout', text='NOT MINE'))
-    kc.route(_reply(r1.msg_id))
-    kc.route(_reply(r2.msg_id))
-    o1, o2 = await asyncio.wait_for(asyncio.gather(r1.collect(), r2.collect()), 5)
-    assert [o['text'] for o in o1] == ['one'] and [o['text'] for o in o2] == ['two']
-    assert r1.status == r2.status == 'ok'
-    assert (await kc.get_msg('iopub', timeout=1))['parent_header']['msg_id'] == 'foreign'
-    assert not kc._claims   # both runs released their claims
-
-
-async def test_run_claim_precedes_send():
-    "Traffic delivered synchronously at send time still reaches the run: the claim exists before `execute` returns."
-    class EagerClient(FakeClient):
-        def execute(self, code, msg_id=None, **kw):
-            for m in _outs(msg_id, 'early'): self.route(m)
-            self.route(_reply(msg_id))
-            return super().execute(code, msg_id=msg_id, **kw)
-    outs = await EagerClient().run('x')
-    assert [o['text'] for o in outs] == ['early']
-
-
-async def test_run_stdin_and_comm():
-    kc = FakeClient()
-    comms = []
-    async def on_stdin(prompt, password): return f'ans:{prompt}'
-    run = Run(kc, 'x', on_stdin=on_stdin, on_comm=lambda mt, c: comms.append(mt))
-    kc.route(_msg('input_request', run.msg_id, channel='stdin', prompt='who'))
-    kc.route(_msg('comm_msg', run.msg_id, comm_id='c1'))
-    for m in _outs(run.msg_id): kc.route(m)
-    kc.route(_reply(run.msg_id))
-    await asyncio.wait_for(run.collect(), 5)
-    assert kc.inputs == ['ans:who'] and comms == ['comm_msg']
-    assert kc.sent[0][2]['allow_stdin'] is True
-
-
-async def test_run_never_iterated_leaks_nothing():
-    kc = FakeClient()
-    run = Run(kc, 'x')
-    assert run.msg_id in kc._claims
-    run.close()
-    assert not kc._claims
+async def test_send_failure_leaves_no_entry():
     class Broken(FakeClient):
         def execute(self, code, **kw): raise OSError('socket closed')
-    kc2 = Broken()
-    with pytest.raises(OSError): Run(kc2, 'x')
-    assert not kc2._claims   # a failed send unregisters its claim
-
-
-async def test_fail_all_ends_runs_and_waiters():
-    kc = FakeClient()
-    fut = kc._register_reply('m1')
-    run = Run(kc, 'x')
-    task = asyncio.ensure_future(run.collect())
-    await asyncio.sleep(0)
-    kc.fail_all(DeadKernelError('gone'))
-    with pytest.raises(DeadKernelError): await asyncio.wait_for(task, 5)
-    with pytest.raises(DeadKernelError): await kc.await_reply(fut, 'm1', timeout=1)
-
-
-async def test_dead_kernel_detected_on_silence():
-    kc = FakeClient()
-    kc.alive = False
-    run = Run(kc, 'x')
-    with pytest.raises(DeadKernelError): await asyncio.wait_for(run.collect(), 5)
-    assert not kc._claims
-
-
-async def test_claim_and_waiter_are_exclusive():
-    kc = FakeClient()
-    run = Run(kc, 'x')
-    with pytest.raises(AssertionError): kc._register_reply(run.msg_id)
-    fut = kc._register_reply('w1')
-    with pytest.raises(AssertionError): kc.claim('w1')
-    run.close()
-
-
-class VerbClient(FakeClient):
-    "A `request` seam over the fake transport: tests answer from `self.answers` by request name."
-    def __init__(self, **answers):
-        super().__init__()
-        self.answers = answers
-
-    def request(self, name, content=None, channel='shell', reply=True, timeout=None, buffers=None, **kw):
-        msg = self.session.msg(name, content or {})
-        self.sent.append((msg['msg_id'], name, content, buffers))
-        if not reply: return msg['msg_id']
-        fut = self._register_reply(msg['msg_id'], channel)
-        self.route(dict(_msg(name.replace('_request', '_reply'), msg['msg_id'], channel=channel), content=self.answers[name]))
-        return self.await_reply(fut, msg['msg_id'], timeout=timeout, channel=channel)
-
-
-async def test_typed_verbs_over_request_seam():
-    kc = VerbClient(complete_request=dict(matches=['import'], cursor_start=0), inspect_request=dict(found=True, data={'text/plain': 'sig'}),
-        is_complete_request=dict(status='incomplete', indent='    '), history_request=dict(history=[[0, 1, 'x=1']]))
-    assert await kc.complete('imp') == (['import'], 0)
-    assert await kc.inspect('print') == 'sig'
-    assert await kc.check('for i in x:') == ('incomplete', '    ')
-    assert (await kc.history())['content']['history'] == [[0, 1, 'x=1']]
-    assert kc.sent[-1][2]['session'] == 0   # range access defaults filled in
-
-
-async def test_inspect_not_found_and_comm_send():
-    kc = VerbClient(inspect_request=dict(found=False))
-    assert await kc.inspect('no_such_name') == ''
-    kc.comm_msg('c1', dict(x=1), buffers=[b'raw'])
-    assert kc.sent[-1][1:] == ('comm_msg', dict(comm_id='c1', data=dict(x=1)), [b'raw'])
+        def send(self, msg, channel): raise OSError('socket closed')
+    kc = Broken()
+    with pytest.raises(OSError): kc.reply('x')
+    assert not kc.replies
+    with pytest.raises(OSError): await kc.run('x')
+    assert not kc.runs
+    with pytest.raises(OSError): kc.request('kernel_info_request')
+    assert not kc.replies
