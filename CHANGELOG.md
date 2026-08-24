@@ -1,5 +1,17 @@
 <!-- do not remove -->
 
+## 0.1.5
+
+### New Features
+
+- Rework RouterOps: reply()/run()/`on_jmsg` replace three-tier queues and Run; add JmsgQueues, generic request seam, kernel-death handling ([#8](https://github.com/AnswerDotAI/jupywire/issues/8))
+- Add jupywire.route with three-tier RouterOps message routing and Run, plus `eval_expr`/`user_exprs` in ops ([#7](https://github.com/AnswerDotAI/jupywire/issues/7))
+
+### Bugs Squashed
+
+- Fix eval error handling to report ename/evalue when kernel reply has no traceback ([#6](https://github.com/AnswerDotAI/jupywire/issues/6))
+
+
 ## 0.1.4
 
 ### New Features
