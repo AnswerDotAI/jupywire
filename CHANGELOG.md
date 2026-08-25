@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.6
+
+### New Features
+
+- Route stdin through run() via an `on_stdin` hook that sends the parented `input_reply`, with `allow_stdin` bound to the hook presence ([#9](https://github.com/AnswerDotAI/jupywire/issues/9))
+
+
 ## 0.1.5
 
 ### New Features
