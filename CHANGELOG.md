@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.7
+
+### New Features
+
+- run() is now an async generator that sends at call time ([#10](https://github.com/AnswerDotAI/jupywire/pull/10)), thanks to [@jph00](https://github.com/jph00)
+
+
 ## 0.1.6
 
 ### New Features
