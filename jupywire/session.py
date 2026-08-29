@@ -11,11 +11,10 @@ guard. Socket-facing `send`/`recv` live with the transports (kernmini's `MiniSes
 the websocket JSON/binary helpers below are the frame layer jupygate's channel protocol uses.
 """
 
-import hashlib, hmac, json, numbers, os, struct, uuid
-from binascii import b2a_base64
-from collections.abc import Iterable
-from datetime import date, datetime, timezone
+import hashlib, hmac, json, os, struct, uuid
+from datetime import datetime, timezone
 from fastcore.basics import xdumps, revive_dates
+from fastcore.nbio import jupyter_json_default
 
 
 DELIM = b"<IDS|MSG>"
@@ -25,21 +24,8 @@ protocol_version = "5.3"
 def utcnow() -> datetime: return datetime.now(timezone.utc)
 
 
-def json_default(obj):
-    "JSON serializer mirroring `jupyter_client.jsonutil.json_default`: ISO-8601 Z-suffix datetimes, b64 bytes, listified iterables, coerced numerics."
-    if isinstance(obj, datetime):
-        if obj.tzinfo is None: obj = obj.replace(tzinfo=timezone.utc)
-        return obj.isoformat().replace("+00:00", "Z")
-    if isinstance(obj, date): return obj.isoformat()
-    if isinstance(obj, bytes): return b2a_base64(obj, newline=False).decode("ascii")
-    if isinstance(obj, Iterable): return list(obj)
-    if isinstance(obj, numbers.Integral): return int(obj)
-    if isinstance(obj, numbers.Real): return float(obj)
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-
 def json_packer(obj) -> bytes:
-    return json.dumps(obj, default=json_default, ensure_ascii=False, allow_nan=False,
+    return json.dumps(obj, default=jupyter_json_default, ensure_ascii=False, allow_nan=False,
         separators=(",", ":")).encode("utf8", errors="surrogateescape")
 
 

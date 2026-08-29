@@ -5,7 +5,7 @@ from datetime import datetime, timezone, date
 import pytest
 from jupyter_client.session import Session as JCSession
 
-from jupywire.session import (Session, json_default, json_packer, serialize_binary_message,
+from jupywire.session import (Session, json_packer, serialize_binary_message,
     deserialize_binary_message, validate_string_dict, dumps, loads, DELIM)
 from jupywire.connect import write_connection_file
 
@@ -40,12 +40,13 @@ def test_roundtrip_via_jupyter_client():
 
 
 def test_json_default_parity():
+    from fastcore.nbio import jupyter_json_default
     from jupyter_client.jsonutil import json_default as jc_default
     aware = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
-    for v in (aware, date(2026, 1, 2), b"some bytes", {1, 2, 3}): assert json_default(v) == jc_default(v)
+    for v in (aware, date(2026, 1, 2), b"some bytes", {1, 2, 3}): assert jupyter_json_default(v) == jc_default(v)
     naive = datetime(2026, 1, 2, 3, 4, 5)
-    assert json_default(naive) == "2026-01-02T03:04:05Z"  # naive treated as UTC (jupyter_client's local-time reading is deprecated)
-    with pytest.raises(TypeError): json_default(object())
+    assert jupyter_json_default(naive) == "2026-01-02T03:04:05Z"  # naive treated as UTC (jupyter_client's local-time reading is deprecated)
+    with pytest.raises(TypeError): jupyter_json_default(object())
     assert json.loads(json_packer(dict(b=b"xy", t=aware)).decode()) == json.loads(
         json.dumps(dict(b=b"xy", t=aware), default=jc_default))
 
