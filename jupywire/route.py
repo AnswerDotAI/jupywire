@@ -6,9 +6,10 @@ message whose parent msg_id has a `reply()` or `request` future resolves it. A m
 a `run()` in flight is collected by that run; its stdin request goes to that run's `on_stdin` hook,
 whose return value jupywire sends as the correctly parented `input_reply`.
 Every other message goes to the app's `on_jmsg` callback, and an app that sets no callback drops
-them. `reply()` sends at call time and returns an awaitable of the `execute_reply`. `run()` sends
-when awaited and returns every parented shell, control, and iopub message, up to and including the
-`execute_reply` and the idle status. It disables stdin unless supplied an `on_stdin` hook.
+them. `reply()` sends at call time and returns an awaitable of the `execute_reply`. `run()` also
+sends at call time, returning an async generator of every parented shell, control, and iopub
+message, up to and including the `execute_reply` and the idle status; `exec_outs` collects its
+rendered outputs. `run` disables stdin unless supplied an `on_stdin` hook.
 `request` sends any named protocol request, `shell` and `control` name its channel, and the typed
 verbs (`complete`, `inspect`, `check`, `history`) sit on top. `input` answers an explicit
 `input_request`, or the most recent unmatched request that `route` remembers. A dead-kernel status fails every waiter through
@@ -30,6 +31,8 @@ OUTPUT_MSGS = ('stream', 'display_data', 'execute_result', 'error')
 COMM_MSGS = ('comm_open', 'comm_msg', 'comm_close')
 
 class DeadKernelError(RuntimeError): pass
+
+_END = object()   # closes a run's message stream
 
 
 class RouterOps:
@@ -72,28 +75,25 @@ class RouterOps:
         except Exception as e:
             r['error'] = e
             try: await self.control('interrupt_request')
-            except Exception:
-                if not r.fut.done(): r.fut.set_exception(e)
+            except Exception: r.q.put_nowait(_END)
 
     def _run_msg(self, parent, r, msg):
-        "Fold one message into its run: collect, stream, complete on reply plus idle."
-        r.msgs.append(msg)
-        if r.on_output is not None: r.on_output(msg)
+        "Fold one message into its run: enqueue for its generator, and end the stream on reply plus idle."
+        r.q.put_nowait(msg)
         mt = msg['msg_type']
         if mt == 'execute_reply': r['got_reply'] = True
         if mt == 'status' and msg['content'].get('execution_state') == 'idle': r['got_idle'] = True
         if r.got_reply and r.got_idle:
             self.runs.pop(parent)
-            if not r.fut.done():
-                if r.error is None: r.fut.set_result(r.msgs)
-                else: r.fut.set_exception(r.error)
+            r.q.put_nowait(_END)
 
     def fail_waiters(self, exc):
         "Fail every `reply()` future and in-flight `run()`: kernel death, transport loss, client close."
         for fut in self.replies.values():
             if not fut.done(): fut.set_exception(exc)
         for r in self.runs.values():
-            if not r.fut.done(): r.fut.set_exception(exc)
+            if r.error is None: r['error'] = exc
+            r.q.put_nowait(_END)
             for task in r.stdin_tasks: task.cancel()
         self.replies.clear()
         self.runs.clear()
@@ -147,23 +147,34 @@ class RouterOps:
         "Send a named control request, e.g. `control('interrupt_request')`."
         return self.request(name, content, 'control', timeout=timeout)
 
-    async def run(self, code, on_output=None, on_stdin=None, timeout=None, msg_id=None, **kw):
-        "Every message parented to this execute, up to and including its `execute_reply` and idle status; sends when awaited."
+    def run(self, code, on_stdin=None, timeout=None, msg_id=None, **kw):
+        "Async generator of every message parented to this execute, up to and including its `execute_reply` and idle status; the send happens now."
         mid = msg_id or self.new_msg_id()
         if timeout is None: timeout = getattr(self, 'default_timeout', None)
-        fut = asyncio.get_running_loop().create_future()
-        r = self.runs[mid] = dict2obj(msgs=[], fut=fut, got_reply=False, got_idle=False, on_output=on_output,
+        end = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        r = self.runs[mid] = dict2obj(mid=mid, q=asyncio.Queue(), got_reply=False, got_idle=False,
             on_stdin=on_stdin, stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context())
-        try:
-            self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
-            return await asyncio.wait_for(fut, timeout)
-        finally:
+        try: self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
+        except BaseException:
             self.runs.pop(mid, None)
+            raise
+        return self._run_gen(r, end)
+
+    async def _run_gen(self, r, end):
+        try:
+            while True:
+                async with asyncio.timeout_at(end): m = await r.q.get()
+                if m is _END:
+                    if r.error is not None: raise r.error
+                    return
+                yield m
+        finally:
+            self.runs.pop(r.mid, None)
             for task in r.stdin_tasks: task.cancel()
 
     async def exec_outs(self, code, **kw):
         "Just the rendered nbformat outputs of running `code`."
-        return [msg2out(m) for m in await self.run(code, **kw) if m['msg_type'] in OUTPUT_MSGS]
+        return [msg2out(m) async for m in self.run(code, **kw) if m['msg_type'] in OUTPUT_MSGS]
 
     def input(self, string, request=None):
         "Answer an `input_request`; defaults to the most recent unmatched request."

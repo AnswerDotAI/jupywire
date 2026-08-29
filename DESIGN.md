@@ -57,27 +57,38 @@ The `done()` guard exists because `set_result` raises `InvalidStateError` on a f
 
 ## run()
 
-Tool calls need a third pattern. Most tools run as silent executes, where ipyai's `KernelBridge` sends the tool call with `reply()` and reads the result back through `user_expressions`. The `py` tool cannot, because its result is whatever the code printed or displayed, and those arrive as iopub messages. The same need appears in clikernel, teleprint, and test helpers. Each runs one piece of code and wants its outputs back.
+Tool calls need a third pattern. Most tools run as silent executes, where ipyai's `KernelBridge` sends the tool call with `reply()` and reads the result back through `user_expressions`. The `py` tool cannot, because its result is whatever the code printed or displayed, and those arrive as iopub messages. The same need appears in clikernel, teleprint, and test helpers. Each runs one piece of code and wants its outputs back, and the interactive consumers want each output as it arrives, not a list at the end.
 
-`run(code)` returns a list of the messages parented to its execute, up to and including the `execute_reply` and the idle status. Optional hooks receive output and stdin traffic as it arrives:
+`run(code)` sends at call time, exactly as `reply()` does, and returns an async generator yielding every message parented to its execute, up to and including the `execute_reply` and the idle status:
 
 ```python
-async def run(self, code, on_output=None, on_stdin=None, timeout=None, msg_id=None, **kw):
+def run(self, code, on_stdin=None, timeout=None, msg_id=None, **kw):
     mid = msg_id or self.new_msg_id()
-    fut = asyncio.get_running_loop().create_future()
-    r = self.runs[mid] = dict2obj(msgs=[], fut=fut, got_reply=False, got_idle=False, on_output=on_output,
+    end = None if timeout is None else asyncio.get_running_loop().time() + timeout
+    r = self.runs[mid] = dict2obj(mid=mid, q=asyncio.Queue(), got_reply=False, got_idle=False,
         on_stdin=on_stdin, stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context())
-    try:
-        self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
-        return await asyncio.wait_for(fut, timeout)
-    finally:
+    try: self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
+    except BaseException:
         self.runs.pop(mid, None)
+        raise
+    return self._run_gen(r, end)
+
+async def _run_gen(self, r, end):
+    try:
+        while True:
+            async with asyncio.timeout_at(end): m = await r.q.get()
+            if m is _END:
+                if r.error is not None: raise r.error
+                return
+            yield m
+    finally:
+        self.runs.pop(r.mid, None)
         for task in r.stdin_tasks: task.cancel()
 ```
 
-Each run entry names its state: collected `msgs`, completion `fut`, `got_reply`, `got_idle`, the two callbacks, the active `stdin_tasks`, any stdin callback `error`, and the caller's `stdin_context`. `dict2obj` keeps reads legible (`r.fut`, `r.msgs`); mutations retain item assignment because its attribute form is read-only. `_run_msg` appends parented shell, control, and iopub messages. stdin is a routing event and is never collected as output. Completion requires both the shell reply and the idle status because channels do not share an ordering guarantee.
+Each run entry names its state: the message queue `q`, `got_reply`, `got_idle`, the stdin hook, the active `stdin_tasks`, any stdin callback `error`, and the caller's `stdin_context`. `dict2obj` keeps reads legible (`r.q`, `r.error`); mutations retain item assignment because its attribute form is read-only. Entry filing and the send both happen in the plain `def`, before the generator exists, so no reply can slip past and wire order is call order. Concurrent calls have independent entries and collect independently. stdin is disabled unless the caller supplies `on_stdin`, binding permission to the handler that can actually service it, and stdin is a routing event, never yielded as output. Completion requires both the shell reply and the idle status because channels do not share an ordering guarantee.
 
-`run()` is an `async def` and sends only when awaited. An unawaited `run()` sends nothing and files nothing. Concurrent calls have independent entries and collect independently. stdin is disabled unless the caller supplies `on_stdin`, binding permission to the handler that can actually service it.
+The generator's `finally` is the one cleanup path for every exit: completion, timeout (the deadline is fixed at send time), an error raised through the sentinel, or a consumer abandoning the stream. An abandoned run's entry is popped, so its remaining traffic flows to `on_jmsg` like any other unmatched message; a consumer that breaks out early closes the generator deterministically with `aclosing`. A generator never iterated at all leaves its entry until the kernel finishes the cell, at which point `_run_msg` pops it: a fire-and-forget execute whose buffering cleans itself up.
 
 `route()` grows one branch, pulled out as a helper:
 
@@ -90,25 +101,22 @@ def route(self, msg):
     self.on_jmsg(msg)
 
 def _run_msg(self, parent, r, msg):
-    r.msgs.append(msg)
-    if r.on_output is not None: r.on_output(msg)
+    r.q.put_nowait(msg)
     mt = msg['msg_type']
     if mt == 'execute_reply': r['got_reply'] = True
     if mt == 'status' and msg['content'].get('execution_state') == 'idle': r['got_idle'] = True
     if r.got_reply and r.got_idle:
         self.runs.pop(parent)
-        if not r.fut.done():
-            if r.error is None: r.fut.set_result(r.msgs)
-            else: r.fut.set_exception(r.error)
+        r.q.put_nowait(_END)
 ```
 
 `route()` pops the entry as it resolves, so a message parented to a finished run flows to `on_jmsg` like any other unmatched message. Output printed by a background thread after idle reaches the app rather than a dead entry.
 
-Most callers of `run()` want rendered outputs rather than raw messages. `exec_outs(code)` awaits `run` and keeps only the output messages, converted to nbformat form by fastcore.nbio's `msg2out`:
+Many callers of `run()` want rendered outputs rather than raw messages. `exec_outs(code)` is the listified form, keeping only the output messages, converted to nbformat form by fastcore.nbio's `msg2out`:
 
 ```python
 async def exec_outs(self, code, **kw):
-    return [msg2out(m) for m in await self.run(code, **kw) if m['msg_type'] in OUTPUT_MSGS]
+    return [msg2out(m) async for m in self.run(code, **kw) if m['msg_type'] in OUTPUT_MSGS]
 ```
 
 `OUTPUT_MSGS` is `('stream', 'display_data', 'execute_result', 'error')`. clikernel's `execute_outs` becomes one call to `exec_outs`.
@@ -134,7 +142,8 @@ def _kernel_died(self, msg):
     for fut in self.replies.values():
         if not fut.done(): fut.set_exception(exc)
     for r in self.runs.values():
-        if not r.fut.done(): r.fut.set_exception(exc)
+        if r.error is None: r['error'] = exc
+        r.q.put_nowait(_END)
         for task in r.stdin_tasks: task.cancel()
     self.replies.clear()
     self.runs.clear()
@@ -157,17 +166,17 @@ The typed verbs `complete`, `inspect`, `check`, and `history` remain, written on
 
 Comms are the one shell-channel send outside this pattern. A comm message never gets a reply, so `comm_open` and `comm_msg` build their messages and send them through `send(msg, channel)` without filing anything, returning the msg_id. Inbound comm traffic follows the general routing. A comm message parented to a `run()` is collected by that run. Any other comm message reaches `on_jmsg`.
 
-## run hooks
+## The stdin hook
 
-A streaming consumer wants each message as it arrives rather than a list at the end. clikernel's `stream.py` emits an event per output. `run(code, on_output=cb)` serves it: `_run_msg` passes each collected message to `cb` as it appends it, without changing the collected result.
+A streaming consumer needs no hook: it iterates the generator and renders inside its own loop body, awaiting freely. clikernel's `stream.py` and ipyai's `run_cell` work this way, and errors in their rendering propagate to their callers like any other exception.
 
-`on_stdin` is not merely a notification. It receives an `input_request` parented to the run and returns that prompt's answer, either directly or through an awaitable. jupywire sends the resulting `input_reply`, correctly parented to the request. A caller describes the interaction in one straight-line callback; it does not manage a second queue, a continuation loop, or prompt lifecycle state.
+`on_stdin` remains a hook because it is not merely a notification. It receives an `input_request` parented to the run and returns that prompt's answer, either directly or through an awaitable. jupywire sends the resulting `input_reply`, correctly parented to the request. A caller describes the interaction in one straight-line callback; it does not manage a second queue, a continuation loop, or prompt lifecycle state.
 
 ## stdin
 
 When running code calls `input()`, the kernel sends an `input_request` on the stdin channel and blocks until the client answers. That request is the channel's entire inbound traffic. The reply direction belongs to the client, so `route()` never sees an `input_reply`.
 
-`run()` owns stdin for executions it owns. Its `on_stdin` hook receives the complete `input_request`, just as `on_output` receives complete output messages. Supplying the hook sets `allow_stdin=True`; omitting it sets `allow_stdin=False`, so a noninteractive collected run gets `StdinNotImplementedError` rather than hanging.
+`run()` owns stdin for executions it owns. Its `on_stdin` hook receives the complete `input_request`. Supplying the hook sets `allow_stdin=True`; omitting it sets `allow_stdin=False`, so a noninteractive collected run gets `StdinNotImplementedError` rather than hanging.
 
 ```python
 async def answer(req):
@@ -212,7 +221,7 @@ async def _answer_stdin(self, r, msg):
         r['error'] = e
         try: await self.control('interrupt_request')
         except Exception:
-            if not r.fut.done(): r.fut.set_exception(e)
+            r.q.put_nowait(_END)
 ```
 
 ## on_jmsg and pulling
