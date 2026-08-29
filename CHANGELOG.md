@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.8
+
+### New Features
+
+- Use fastcore `jupyter_json_default` instead of local `json_default` in session ([#11](https://github.com/AnswerDotAI/jupywire/issues/11))
+
+
 ## 0.1.7
 
 ### New Features
