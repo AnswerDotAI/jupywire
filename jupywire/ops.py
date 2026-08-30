@@ -1,4 +1,4 @@
-"""Client-side call conventions for a Jupyter kernel: `eval`, `ipy`, and friends over two abstract transport seams.
+"""Client-side call conventions for a Jupyter kernel: `eval`, `ipy`, and friends over shared client routing seams.
 
 `EvalOps` is a mixin for kernel clients (conkernelclient's `ConKernelClient`, jupyasyncclient's
 `JupyAsyncKernelClient`): the inheritor supplies `reply(code, user_expressions=, timeout=,
@@ -8,10 +8,9 @@ function by name, result reconstructed by repr), `ipy` (`get_ipython()` methods)
 `ipyfuncs` service methods, `retr`, and the sync `xpush`/`xenv`. Setting names in a kernel has no
 useful reply, so those two are sync and fire-and-forget; ordering still holds, because a transport
 delivers requests in send order.
-`priority=` sends kernmini's `priority: 1` execute metadata, so the request overtakes queued work
-(a held prompt turn, a Run-all's tail); a running request is never preempted, and kernels that do
-not know the key ignore it. The `ipyfuncs` service methods default it on, since each is a small
-out-of-band call made on the user's behalf; `eval` and `retr` run user code and default it off.
+`sidecar_=` routes through the kernel's persistent named sidecar subshell. The `ipyfuncs` service
+methods default it on, since each is a small out-of-band call made on the user's behalf. `xpush`
+and `retr` also default to that serial lane; ordinary `eval` defaults to the main shell.
 `_pre_ipy` is a liveness hook (default no-op).
 The module also carries the message-dict helpers shared by both clients' consumers: `parent_id`,
 `iopub_msgs`, and the `output_types` set.
@@ -70,19 +69,19 @@ class EvalOps:
 
     def _pre_ipy(self): pass   # liveness hook: transports may raise their dead-kernel error here
 
-    async def eval(self, func:str, *args, _timeout=60, _literal=True, _priority=False, _call=True, _msg_id=None, **kw):
+    async def eval(self, func:str, *args, timeout_=60, literal_=True, sidecar_=False, call_=True, msg_id_=None, **kw):
         "Result of running `func(*args, **kw)`"
         vname = f'__{rtoken_hex(4)}'
-        if _call:
+        if call_:
             code = f'''import asyncio
 {vname} = {func}(*{args!r}, **{kw!r})
 if asyncio.iscoroutine({vname}): {vname} = await {vname}
 '''
         else: code = f'{vname} = {func}'
         exprs = dict(__res=vname, __typ=f"type({vname}).__name__", __del=f"globals().pop('{vname}', None)")
-        kw2 = dict(user_expressions=exprs, timeout=_timeout, store_history=False)
-        if _priority: kw2['metadata'] = dict(priority=1)
-        if _msg_id is not None: kw2['msg_id'] = _msg_id
+        kw2 = dict(user_expressions=exprs, timeout=timeout_, store_history=False)
+        if sidecar_: kw2['subshell_id'] = 'sidecar'
+        if msg_id_ is not None: kw2['msg_id'] = msg_id_
         try: cts = (await self.reply(code, **kw2))['content']
         except TimeoutError: return 'timeout'
         except TypeError as e: raise EvalException(f"Eval failed: {e}")  # e.g. kernel not running
@@ -95,21 +94,21 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
         res = nested_idx(cts, 'user_expressions', '__res', 'data')
         if not res: return res
         res = preferred_out(res, html1st=False)[1]
-        try: return try_eval(res, typ) if _literal else res
+        try: return try_eval(res, typ) if literal_ else res
         except Exception as e: return str(e)
 
-    async def ipy(self, meth, *args, priority=True, timeout=5, **kwargs):
+    async def ipy(self, meth, *args, sidecar_=True, timeout_=5, **kwargs):
         if not hasattr(self, '_ipylock'): self._ipylock = asyncio.Lock()
         self._pre_ipy()
-        async with self._ipylock: return await self.eval('get_ipython().'+meth, _priority=priority, _timeout=timeout, *args, **kwargs)
+        async with self._ipylock: return await self.eval('get_ipython().'+meth, sidecar_=sidecar_, timeout_=timeout_, *args, **kwargs)
 
-    def xpush(self, **kwargs):
+    def xpush(self, sidecar_=True, **kwargs):
         "Bind `kwargs` as names in the kernel's user namespace"
-        self.execute(f'get_ipython().push({kwargs!r})')
+        return self.execute(f'get_ipython().push({kwargs!r})', subshell_id='sidecar' if sidecar_ else None)
 
-    async def retr(self, nm:str, priority=False):
+    async def retr(self, nm:str, sidecar_=True):
         "Retrieve a single variable value"
-        return await self.eval(nm, _call=False, _priority=priority, _timeout=60)
+        return await self.eval(nm, call_=False, sidecar_=sidecar_, timeout_=60)
 
     async def user_exprs(self, exprs:dict, code:str='', timeout=10, **kw):
         "Run `code` and evaluate each of the `exprs` expressions in the same round trip; returns the reply content (statuses and mimebundles unparsed)"
@@ -137,4 +136,3 @@ def _mk_ipy(meth):
 
 _ipy_funcs = ['user_items', 'get_vars', 'eval_exprs', 'get_schemas', 'publish', 'ranked_complete', 'sig_help']
 for o in _ipy_funcs: _mk_ipy(o)
-

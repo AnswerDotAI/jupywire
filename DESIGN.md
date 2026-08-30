@@ -39,6 +39,10 @@ def reply(self, code, timeout=None, msg_id=None, **kw):
 
 `reply()` is a sync function that sends at call time and returns an awaitable. A caller can send now and collect later by holding the awaitable, which an `async def` cannot express. The cost is the abandoned call. A caller that never awaits has already sent. Its entry stays until the reply arrives, the kernel dies, or the client closes. All three paths clean the entry up.
 
+## The named sidecar
+
+Reentrant service calls should not overtake the main shell queue or require the running cell to make that queue concurrent. `EvalOps` tags them with `subshell_id='sidecar'`; kernmini creates a missing named subshell when the first tagged request arrives. Its small `ipyfuncs` service methods and variable operations (`xpush`, `get_vars`, `eval_exprs`, and `retr`) use that serial lane by default. Ordinary `eval` remains on the serial main shell unless explicitly routed.
+
 ## A first route()
 
 ```python
