@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.9
+
+### New Features
+
+- Route reentrant kernel services through a named sidecar ([#12](https://github.com/AnswerDotAI/jupywire/pull/12)), thanks to [@jph00](https://github.com/jph00)
+
+
 ## 0.1.8
 
 ### New Features
