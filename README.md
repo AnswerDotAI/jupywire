@@ -1,13 +1,15 @@
 # jupywire
 
-Minimal Jupyter protocol commons: wire-format sessions (message construction, HMAC signing, frame serialize/deserialize) and kernel-client call conventions, shared by kernmini, jupygate, jupyasyncclient, and conkernelclient.
+`jupywire` provides shared Jupyter protocol code for kernmini, jupygate, jupyasyncclient, and conkernelclient. It handles wire-format messages, connection files, and common kernel-client operations.
 
 ## What's here
 
-- `jupywire.session`: `Session` — Jupyter protocol messages: construction, HMAC signing, frame (de)serialization, replay protection — plus the websocket JSON/binary frame helpers (`dumps`/`loads`, `serialize_binary_message`/`deserialize_binary_message`) and `validate_string_dict`.
-- `jupywire.connect`: `write_connection_file` — kernel connection files with random free-port selection, written 0600.
-- `jupywire.route`: `RouterOps` and `JmsgQueues` — message handling for kernel clients. `reply()` awaits one `execute_reply`; `run()` sends at call time and returns an async generator of every message one execute causes (`exec_outs` is its listified, rendered form), and turns each `on_stdin` return value into the correctly parented `input_reply` (stdin is disabled when that hook is absent). Everything unmatched goes to the app's `on_jmsg` callback, with `JmsgQueues` as the pull adapter. A generic `request` sends any named protocol request, with `shell`/`control` sugar and typed verbs (`complete`, `inspect`, `check`, `history`, `comm_msg`) on top. The transport supplies `execute`, `send`, a `session`, and a read loop feeding `route`. DESIGN.md states the full contract; `tests/test_route.py` is the conformance suite both clients inherit.
-- `jupywire.ops`: `EvalOps` — a mixin giving any kernel client the calling conventions (`eval`, `ipy`, the `ipyfuncs` service methods, `retr`, `eval_expr`/`user_exprs`, and the sync fire-and-forget `xpush`/`xenv`) over `reply`, which awaits the shell reply, and `execute`, which sends without awaiting one. `sidecar_=True` tags an evaluation for the persistent sidecar; kernmini creates a missing named subshell on first use. Variable operations default to that serial sidecar lane, while ordinary `eval` defaults to the main shell.
+The package has four modules:
+
+- `jupywire.session` provides `Session` for constructing and HMAC-signing Jupyter messages. It serializes and deserializes frames and provides replay protection. The module also includes websocket JSON helpers (`dumps` and `loads`), binary helpers (`serialize_binary_message` and `deserialize_binary_message`), and `validate_string_dict`.
+- `jupywire.connect` provides `write_connection_file`. It selects random free ports and writes a kernel connection file with permissions `0600`.
+- `jupywire.route` provides `RouterOps` for routing kernel-client messages and `JmsgQueues` for queue-based access to them.
+- `jupywire.ops` provides `EvalOps`, a mixin for evaluation and variable operations on kernel clients.
 
 ## Install
 
@@ -15,9 +17,32 @@ Minimal Jupyter protocol commons: wire-format sessions (message construction, HM
 pip install jupywire
 ```
 
+## Client messages
+
+`RouterOps` provides these ways to receive execution results:
+
+- `reply()` awaits one `execute_reply`.
+- `run()` sends the execution request when called. It returns an async generator of every message caused by that execution.
+- `exec_outs` collects the results from `run` and returns a list of rendered results.
+
+`run` uses each return value from `on_stdin` to send an `input_reply` with the correct parent. Without an `on_stdin` hook, stdin is disabled.
+
+Unmatched messages go to the application's `on_jmsg` callback. Use `JmsgQueues` to pull those messages from queues.
+
+`request` sends any named protocol request. `shell` and `control` provide channel-specific helpers. Named methods include `complete`, `inspect`, `check`, `history`, and `comm_msg`.
+
+The transport must supply `execute`, `send`, and a `session`. Its read loop passes incoming messages to `route`. [DESIGN.md](DESIGN.md) specifies the full contract. Both clients inherit the conformance suite in `tests/test_route.py`.
+
+## Evaluation and variables
+
+`EvalOps` provides `eval`, `ipy`, the `ipyfuncs` service methods, `retr`, `eval_expr`, and `user_exprs`. It also provides `xpush` and `xenv` for synchronous fire-and-forget calls.
+
+These operations use the client's `reply` or `execute` method. `reply` waits for a shell reply. `execute` sends without awaiting a reply.
+
+Pass `sidecar_=True` to evaluate in the persistent sidecar. kernmini creates a missing named subshell on first use. Variable operations use this serial sidecar by default. Ordinary `eval` calls use the main shell by default.
 
 ## Credits
 
-`jupywire.session` and `jupywire.connect` are adapted from [jupyter_client](https://github.com/jupyter/jupyter_client) (`jupyter_client.session`, `jupyter_client.connect`, `jupyter_client.client`), Copyright (c) Jupyter Development Team, distributed under the terms of the Modified BSD License (BSD-3-Clause); see that project's COPYING.md.
+`jupywire.session` and `jupywire.connect` are adapted from [jupyter_client](https://github.com/jupyter/jupyter_client), specifically `jupyter_client.session`, `jupyter_client.connect`, and `jupyter_client.client`. Copyright (c) Jupyter Development Team. The source is distributed under the Modified BSD License (BSD-3-Clause). See that project's COPYING.md.
 
-The adaptations are trimmed, traitlets-free mirrors that stay wire-compatible. Divergences are noted in each module's docstring.
+The adaptations remove traitlets and retain wire compatibility. Each module's docstring records its differences from the original.
