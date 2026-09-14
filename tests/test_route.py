@@ -66,7 +66,7 @@ async def test_reply_lifecycle():
     r1, r2 = await w1, await w2
     assert r1['parent_header']['msg_id'] == first
     assert r2['parent_header']['msg_id'] == 'cell1.aa11'
-    assert [m['msg_type'] for m in seen] == ['status', 'stream']
+    assert [m['msg_type'] for m in seen] == ['status', 'stream', 'execute_reply', 'execute_reply']
     assert not kc.replies
 
     w = kc.reply('slow', timeout=0.01)
@@ -86,18 +86,21 @@ async def test_run_completion_boundary():
     kc = FakeClient()
     seen = _watch(kc)
     for i,idle_first in enumerate((True, False)):
+        seen.clear()
         mid = f'c.2.{i}'
         gen = kc.run('x', msg_id=mid)
         outs = list(_outs(mid, 'hi'))
-        for msg in (outs + [_reply(mid)]) if idle_first else ([_reply(mid)] + outs): kc.route(msg)
+        incoming = (outs + [_reply(mid)]) if idle_first else ([_reply(mid)] + outs)
+        for msg in incoming: kc.route(msg)
         msgs = await alist(gen)
         assert len(msgs) == 4
         assert {m['msg_type'] for m in msgs} == {'status', 'stream', 'execute_reply'}
         assert not kc.runs
+        assert seen == incoming
 
     late = _msg('stream', mid, name='stdout', text='from a background thread')
     kc.route(late)
-    assert seen == [late]
+    assert seen == incoming + [late]
 
 
 async def test_runs_concurrent_and_isolated():
@@ -112,7 +115,7 @@ async def test_runs_concurrent_and_isolated():
     m1, m2 = await alist(g1), await alist(g2)
     assert [m['content']['text'] for m in m1 if m['msg_type'] == 'stream'] == ['one']
     assert [m['content']['text'] for m in m2 if m['msg_type'] == 'stream'] == ['two']
-    assert seen[0]['content']['text'] == 'NOT MINE'
+    assert [m['content']['text'] for m in seen if m['msg_type']=='stream'] == ['two', 'one', 'NOT MINE']
     assert not kc.runs
 
 
@@ -188,7 +191,7 @@ async def test_run_stdin_callback_lifecycle():
     assert kc.route(req) is None
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert prompts == [('run', req)] and not seen
+    assert prompts == [('run', req)] and seen == [req]
     ch, m = kc.sent_msgs[-1]
     assert (ch, m['content']) == ('stdin', dict(value='Jeremy'))
     assert m['parent_header']['msg_id'] == req['header']['msg_id']

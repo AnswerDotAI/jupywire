@@ -2,6 +2,8 @@
 
 Agreed 2026-08-23. This is the target design for `jupywire.route` and its two clients, jupyasyncclient (websocket) and conkernelclient (zmq). It replaces `RouterOps`, `Run`, and `claim`. Each mechanism below appears at the point where the problem it solves appears.
 
+Updated 2026-09-13: `on_jmsg` observes every inbound message once, after routing to its request owner. The intermediate routing sketches below build up request ownership; the final routing section adds the shared notification path.
+
 ## The wire
 
 A kernel and its client exchange messages on four channels. shell carries requests and their replies. control carries requests that must not queue behind shell. iopub is a broadcast of everything the kernel does while it works. stdin carries the kernel's questions to the user.
@@ -16,7 +18,7 @@ The transports converge before this design begins. conkernelclient runs one `_pu
 
 The caller may pass its own msg_id, because the kernel treats the msg_id as an opaque string. The kernel copies the whole request header into `parent_header` on every message the request causes. The msg_id is therefore a tag the client controls. Solveit and ipyai tag each cell execute with `{cell_id}.{token}`, and every message that cell produces comes back naming its cell.
 
-Fire and forget is the idiomatic use for UI cells. The app sends the tagged execute and returns to its event loop. The cell's outputs, statuses, and reply arrive later, through the `on_jmsg` callback described below. The app never awaits a cell's reply.
+UI cells can use fire-and-forget `execute`. Apps that need completion or failure handling can retain `run` and render through `on_jmsg`. Solveit uses this separation for code execution and held AI turns.
 
 ## reply()
 
@@ -66,12 +68,13 @@ Tool calls need a third pattern. Most tools run as silent executes, where ipyai'
 `run(code)` sends at call time, exactly as `reply()` does, and returns an async generator yielding every message parented to its execute, up to and including the `execute_reply` and the idle status:
 
 ```python
-def run(self, code, on_stdin=None, timeout=None, msg_id=None, **kw):
+def run(self, code, on_stdin=None, timeout=None, msg_id=None, allow_stdin=None, **kw):
     mid = msg_id or self.new_msg_id()
+    if allow_stdin is None: allow_stdin = on_stdin is not None
     end = None if timeout is None else asyncio.get_running_loop().time() + timeout
     r = self.runs[mid] = dict2obj(mid=mid, q=asyncio.Queue(), got_reply=False, got_idle=False,
         on_stdin=on_stdin, stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context())
-    try: self.execute(code, msg_id=mid, allow_stdin=on_stdin is not None, **kw)
+    try: self.execute(code, msg_id=mid, allow_stdin=allow_stdin, **kw)
     except BaseException:
         self.runs.pop(mid, None)
         raise
@@ -90,7 +93,7 @@ async def _run_gen(self, r, end):
         for task in r.stdin_tasks: task.cancel()
 ```
 
-Each run entry names its state: the message queue `q`, `got_reply`, `got_idle`, the stdin hook, the active `stdin_tasks`, any stdin callback `error`, and the caller's `stdin_context`. `dict2obj` keeps reads legible (`r.q`, `r.error`); mutations retain item assignment because its attribute form is read-only. Entry filing and the send both happen in the plain `def`, before the generator exists, so no reply can slip past and wire order is call order. Concurrent calls have independent entries and collect independently. stdin is disabled unless the caller supplies `on_stdin`, binding permission to the handler that can actually service it, and stdin is a routing event, never yielded as output. Completion requires both the shell reply and the idle status because channels do not share an ordering guarantee.
+Each run entry names its state: the message queue `q`, `got_reply`, `got_idle`, the stdin hook, the active `stdin_tasks`, any stdin callback `error`, and the caller's `stdin_context`. `dict2obj` keeps reads legible (`r.q`, `r.error`); mutations retain item assignment because its attribute form is read-only. Entry filing and the send both happen in the plain `def`, before the generator exists, so no reply can slip past and wire order is call order. Concurrent calls have independent entries and collect independently. stdin permission defaults to whether the caller supplies `on_stdin`; an explicit `allow_stdin` overrides it. stdin is a routing event, never yielded as output. Completion requires both the shell reply and the idle status because channels do not share an ordering guarantee.
 
 The generator's `finally` is the one cleanup path for every exit: completion, timeout (the deadline is fixed at send time), an error raised through the sentinel, or a consumer abandoning the stream. An abandoned run's entry is popped, so its remaining traffic flows to `on_jmsg` like any other unmatched message; a consumer that breaks out early closes the generator deterministically with `aclosing`. A generator never iterated at all leaves its entry until the kernel finishes the cell, at which point `_run_msg` pops it: a fire-and-forget execute whose buffering cleans itself up.
 
@@ -180,7 +183,7 @@ A streaming consumer needs no hook: it iterates the generator and renders inside
 
 When running code calls `input()`, the kernel sends an `input_request` on the stdin channel and blocks until the client answers. That request is the channel's entire inbound traffic. The reply direction belongs to the client, so `route()` never sees an `input_reply`.
 
-`run()` owns stdin for executions it owns. Its `on_stdin` hook receives the complete `input_request`. Supplying the hook sets `allow_stdin=True`; omitting it sets `allow_stdin=False`, so a noninteractive collected run gets `StdinNotImplementedError` rather than hanging.
+`run()` routes stdin for executions it owns. Its `on_stdin` hook receives the complete `input_request`. By default, supplying the hook sets `allow_stdin=True`; omitting it sets `allow_stdin=False`, so a noninteractive collected run gets `StdinNotImplementedError` rather than hanging. An explicit `allow_stdin` overrides that default. With `allow_stdin=True` and no hook, input requests go to the application's `on_jmsg` callback.
 
 ```python
 async def answer(req):
@@ -191,7 +194,7 @@ msgs = await kc.run("name = input('who? ')", on_stdin=answer)
 
 The callback may wait as long as the user does, but `route()` must not. The same receive loop has to keep routing control replies and kernel-death signals while the callback is suspended. The stdin branch therefore starts one task for the exchange and returns immediately. That task runs in a copy of the context captured by `run()`, not the transport reader's context; request-scoped `ContextVar` values therefore remain attached to the callback that registered them. `_answer_stdin` awaits the callback when necessary, then calls `input(value, request)` with the complete request so concurrent runs cannot cross-parent their replies.
 
-An stdin request parented to a run with a hook goes only to that hook. An unmatched request—for example one caused by fire-and-forget `execute()`—goes to `on_jmsg`, preserving the application-level cell path. stdin messages are routing events, not execution outputs, so `run()` never includes them in its returned message list.
+An stdin request parented to a run with a hook is answered by that hook. Every stdin request also reaches `on_jmsg` once. Observation does not transfer ownership: the app must not answer or render a second prompt when its run callback already handles the exchange. Unmatched requests use the application-level input path. stdin messages are routing events, not execution outputs, so `run()` never includes them in its returned message list.
 
 Each run records its active stdin tasks. Completion, cancellation, client close, and kernel death cancel them. If a callback raises, `_answer_stdin` records the error and sends `interrupt_request`; the kernel is not left blocked forever in `input()`. The run raises that error only after its execute has reached reply and idle, so a caller may safely execute again immediately. This is also why queues are the wrong primitive here: they require separate readers, termination sentinels, exception propagation, and continuation state for a request/reply exchange that is already exactly represented by a callable.
 
@@ -201,6 +204,13 @@ With every branch in place, the whole of `route()` is:
 
 ```python
 def route(self, msg):
+    msg.setdefault('msg_id', msg.get('header', {}).get('msg_id'))
+    msg.setdefault('msg_type', msg.get('header', {}).get('msg_type'))
+    msg.setdefault('buffers', [])
+    self._route(msg)
+    return self._jmsg(msg)
+
+def _route(self, msg):
     if msg['msg_type'] == 'status' and msg['content'].get('execution_state') == 'dead': return self._kernel_died(msg)
     parent = msg.get('parent_header', {}).get('msg_id')
     if msg.get('channel') == 'stdin':
@@ -209,12 +219,10 @@ def route(self, msg):
             task = asyncio.create_task(self._answer_stdin(r, msg), context=r.stdin_context.copy())
             r.stdin_tasks.add(task)
             task.add_done_callback(r.stdin_tasks.discard)
-            return
-        return self._jmsg(msg)
+        return
     if (r := self.runs.get(parent)) is not None: return self._run_msg(parent, r, msg)
     if msg['channel'] in ('shell', 'control'):
         if (fut := self.replies.pop(parent, None)) is not None and not fut.done(): return fut.set_result(msg)
-    return self._jmsg(msg)
 
 async def _answer_stdin(self, r, msg):
     try:
@@ -230,9 +238,9 @@ async def _answer_stdin(self, r, msg):
 
 ## on_jmsg and pulling
 
-`route()` passes every message not matched by `replies`, `runs`, or a run's `on_stdin` hook to `on_jmsg`: cell outputs and statuses, unmatched stdin requests, `cells` traffic, fire-and-forget replies, and the dead status. An app that sets no callback drops them all, and dropping is the correct default, because nothing then accumulates unread. A handler must tolerate message types it does not use. Solveit's `process_jmsg` already does, because an `execute_reply` matches none of its branches and falls through.
+`route()` passes every inbound message to `on_jmsg` once, after routing it to `replies`, `runs`, or a run's `on_stdin` hook. This includes matched replies, collected output, stdin, `cells` traffic and dead status. `_kernel_died` fails waiters; it does not notify the hook separately. No observer queue or message history is kept. A handler must tolerate message types it does not use. Solveit's `process_jmsg` ignores `execute_reply` and excludes ephemeral tool output by request ID.
 
-`on_jmsg` may be sync or async. When the handler returns an awaitable, `_pump` and `_recv_loop` await it before reading the next message, which preserves arrival order. A handler therefore stays a cheap dispatcher and hands heavy work onward. `on_stdin` is deliberately different: `route()` schedules its exchange independently so waiting for human input never stops the receive loop. Solveit's and ipyai's application handlers already have the cheap-dispatcher form.
+`on_jmsg` may be sync or async. When the handler returns an awaitable, `_pump` and `_recv_loop` await it before reading the next message. Keep the handler a cheap dispatcher. Do not await work that needs another kernel reply from that reader. Solveit's handler is synchronous and enqueues browser work. `on_stdin` is different: `route()` schedules its exchange independently so waiting for human input never stops the receive loop.
 
 Some consumers pull rather than accept calls. ipymini's protocol tests await the next iopub message directly. The pull form is a consumer of the push form, and `JmsgQueues` is that consumer. It holds one `asyncio.Queue` per configured channel, sets itself as the client's `on_jmsg` (and as `kc.jmsgq`, so helpers such as `iopub_drain` can find it), dispatches each message to its channel's queue through a merge map, and serves `get(channel, timeout=)`:
 

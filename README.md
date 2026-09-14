@@ -25,9 +25,9 @@ pip install jupywire
 - `run()` sends the execution request when called. It returns an async generator of every message caused by that execution.
 - `exec_outs` collects the results from `run` and returns a list of rendered results.
 
-`run` uses each return value from `on_stdin` to send an `input_reply` with the correct parent. Without an `on_stdin` hook, stdin is disabled.
+`run` uses each return value from `on_stdin` to send an `input_reply` with the correct parent. `allow_stdin` defaults to whether an `on_stdin` hook is present. Pass `allow_stdin=True` without a hook to handle prompts through the application's `on_jmsg` callback.
 
-Unmatched messages go to the application's `on_jmsg` callback. Use `JmsgQueues` to pull those messages from queues.
+Every inbound message also goes once to the application's `on_jmsg` callback, in receive order, after request routing. This includes collected run messages and stdin handled by a run callback. Receiving a notification does not transfer ownership of that stdin exchange. Keep the handler a cheap dispatcher; an awaitable return blocks the transport reader until it completes. Use `JmsgQueues` to pull the same messages from queues.
 
 `request` sends any named protocol request. `shell` and `control` provide channel-specific helpers. Named methods include `complete`, `inspect`, `check`, `history`, and `comm_msg`.
 
