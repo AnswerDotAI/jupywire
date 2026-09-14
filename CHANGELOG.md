@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.10
+
+### New Features
+
+- Route every inbound message to `on_jmsg` once after request routing; add explicit `allow_stdin` override to run() ([#13](https://github.com/AnswerDotAI/jupywire/issues/13))
+
+
 ## 0.1.9
 
 ### New Features
