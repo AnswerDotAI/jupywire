@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.11
+
+### New Features
+
+- Add `on_dead` hook to RouterOps so apps can be notified when the kernel dies ([#14](https://github.com/AnswerDotAI/jupywire/issues/14))
+
+
 ## 0.1.10
 
 ### New Features
