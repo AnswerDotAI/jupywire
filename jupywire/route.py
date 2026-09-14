@@ -13,7 +13,7 @@ rendered outputs. `run` infers stdin permission from `on_stdin` unless `allow_st
 `request` sends any named protocol request, `shell` and `control` name its channel, and the typed
 verbs (`complete`, `inspect`, `check`, `history`) sit on top. `input` answers an explicit
 `input_request`, or the most recent unmatched request that `route` remembers. A dead-kernel status fails every waiter through
-`_kernel_died`; transport-loss and close paths call `fail_waiters` directly. `JmsgQueues` is the
+`_kernel_died`, which then calls the app's `on_dead(msg)` hook if set; transport-loss and close paths call `fail_waiters` directly. `JmsgQueues` is the
 pull adapter: it registers itself as `on_jmsg` (and `kc.jmsgq`) and serves per-channel queues.
 
 The inheritor supplies `execute(code, msg_id=, ...)` sending without awaiting, `send(msg, channel)`
@@ -40,7 +40,7 @@ class RouterOps:
     def _init_router(self):
         self.replies = {}    # msg_id -> future resolved with the matching shell/control reply
         self.runs = {}       # msg_id -> run state
-        self.on_jmsg = None
+        self.on_jmsg,self.on_dead = None,None
         self._last_stdin_req = None
 
     def route(self, msg):
@@ -101,8 +101,9 @@ class RouterOps:
         self.runs.clear()
 
     def _kernel_died(self, msg):
-        "Fail every waiter and run."
+        "Fail every waiter and run, then notify `on_dead`."
         self.fail_waiters(DeadKernelError('kernel died'))
+        if self.on_dead is not None: self.on_dead(msg)
 
     def new_msg_id(self): return self.session.msg_id
 
