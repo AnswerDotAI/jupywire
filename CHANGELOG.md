@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.12
+
+### New Features
+
+- Rebuild reply() on run() so it resolves after the `execute_reply` and the request idle status, and infer stdin context from `on_stdin` ([#15](https://github.com/AnswerDotAI/jupywire/issues/15))
+
+
 ## 0.1.11
 
 ### New Features
