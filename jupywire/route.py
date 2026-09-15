@@ -2,14 +2,14 @@
 
 `RouterOps` is a mixin for kernel clients (conkernelclient's `ConKernelClient`, jupyasyncclient's
 `JupyAsyncKernelClient`). The transport feeds every inbound message to `route`. A shell or control
-message whose parent msg_id has a `reply()` or `request` future resolves it. A message parented to
+message whose parent msg_id has a `request` future resolves it. A message parented to
 a `run()` in flight is collected by that run; its stdin request goes to that run's `on_stdin` hook,
 whose return value jupywire sends as the correctly parented `input_reply`.
 Every inbound message also goes once to the app's `on_jmsg` callback, independently of its
-request routing. `reply()` sends at call time and returns an awaitable of the `execute_reply`. `run()` also
-sends at call time, returning an async generator of every parented shell, control, and iopub
-message, up to and including the `execute_reply` and the idle status; `exec_outs` collects its
-rendered outputs. `run` infers stdin permission from `on_stdin` unless `allow_stdin` is explicit.
+request routing. `run()` sends at call time, returning an async generator of every parented shell, control, and iopub
+message, up to and including the `execute_reply` and the idle status. `reply()` keeps the `execute_reply` of a run
+and resolves once the request's idle status has been routed. `exec_outs` keeps a run's rendered outputs.
+`run` infers stdin permission from `on_stdin` unless `allow_stdin` is explicit.
 `request` sends any named protocol request, `shell` and `control` name its channel, and the typed
 verbs (`complete`, `inspect`, `check`, `history`) sit on top. `input` answers an explicit
 `input_request`, or the most recent unmatched request that `route` remembers. A dead-kernel status fails every waiter through
@@ -126,10 +126,13 @@ class RouterOps:
         return w
 
     def reply(self, code, timeout=None, msg_id=None, **kw):
-        "Run `code`, returning an awaitable of its `execute_reply`; the send happens now."
-        mid = msg_id or self.new_msg_id()
-        w = self._filed(mid, timeout)
-        return self._sent_or_clean(mid, w, lambda: self.execute(code, msg_id=mid, **kw))
+        "Run `code`, returning an awaitable of its `execute_reply`; the send happens now, and the awaitable resolves once the request's idle status has been routed"
+        gen = self.run(code, timeout=timeout, msg_id=msg_id, **kw)
+        async def _wait():
+            async for m in gen:
+                if m['msg_type']=='execute_reply': res = m
+            return res
+        return _wait()
 
     def request(self, name, content=None, channel='shell', timeout=None, buffers=None, msg_id=None, metadata=None, subshell_id=None):
         "Send the named protocol request on `channel`, returning an awaitable of its reply."
@@ -155,8 +158,8 @@ class RouterOps:
         if allow_stdin is None: allow_stdin = on_stdin is not None
         if timeout is None: timeout = getattr(self, 'default_timeout', None)
         end = None if timeout is None else asyncio.get_running_loop().time() + timeout
-        r = self.runs[mid] = dict2obj(mid=mid, q=asyncio.Queue(), got_reply=False, got_idle=False,
-            on_stdin=on_stdin, stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context())
+        r = self.runs[mid] = dict2obj(mid=mid, q=asyncio.Queue(), got_reply=False, got_idle=False, on_stdin=on_stdin,
+            stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context() if on_stdin else None)
         try: self.execute(code, msg_id=mid, allow_stdin=allow_stdin, **kw)
         except BaseException:
             self.runs.pop(mid, None)

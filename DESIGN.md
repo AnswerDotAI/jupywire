@@ -24,22 +24,25 @@ UI cells can use fire-and-forget `execute`. Apps that need completion or failure
 
 Some requests exist for their reply. `eval` sends an execute whose result comes back inside the `execute_reply`, in `user_expressions`. The caller wants that one message and nothing else.
 
-`reply(code)` sends the execute and returns an awaitable of its `execute_reply`:
+`reply(code)` is `run()` reduced to that message. It sends the execute at call time and returns an awaitable that consumes the run and keeps its `execute_reply`:
 
 ```python
 def reply(self, code, timeout=None, msg_id=None, **kw):
-    mid = msg_id or self.new_msg_id()
-    fut = self.replies[mid] = asyncio.get_running_loop().create_future()
-    self.execute(code, msg_id=mid, **kw)
+    gen = self.run(code, timeout=timeout, msg_id=msg_id, **kw)
     async def _wait():
-        try: return await asyncio.wait_for(fut, timeout)
-        finally: self.replies.pop(mid, None)
+        async for m in gen:
+            if m['msg_type']=='execute_reply': res = m
+        return res
     return _wait()
 ```
 
-`self.replies` maps msg_id to future. `route()` fills the future when the matching reply arrives. The `finally` pops the entry however the wait ends, so a timeout or cancellation leaves no entry behind. The `msg_id` parameter serves the same tagging rule as `execute`'s. `EvalOps.eval` already passes one through.
+The awaitable resolves after both the `execute_reply` and the request's idle status. The shell and iopub channels have no ordering guarantee between them. The messaging protocol names the idle status as the signal that a request is complete. A caller that resumes has seen its own output routed through `on_jmsg`. Resolving on the reply alone let a caller resume before its own error message was routed.
 
-`reply()` is a sync function that sends at call time and returns an awaitable. A caller can send now and collect later by holding the awaitable, which an `async def` cannot express. The cost is the abandoned call. A caller that never awaits has already sent. Its entry stays until the reply arrives, the kernel dies, or the client closes. All three paths clean the entry up.
+The deadline is fixed at send time, as for `run`. The stdin default is `run`'s. Without `on_stdin`, `allow_stdin` is `False`, and an unanswered `input()` raises in the kernel. A caller that answers through `on_jmsg` passes `allow_stdin=True`. The `msg_id` parameter follows the same tagging rule as `execute`'s. `EvalOps.eval` passes one through.
+
+`reply()` is a sync function that sends at call time and returns an awaitable. A caller can send now and collect later by holding the awaitable, which an `async def` cannot express. The cost is the abandoned call. A caller that never awaits has already sent. Its run entry stays until the kernel finishes the request, the kernel dies, or the client closes. All three paths remove the entry.
+
+`self.replies`, the msg_id to future map, serves only `request()`. Those are the named protocol requests whose reply is the whole exchange.
 
 ## The named sidecar
 
@@ -57,9 +60,9 @@ def route(self, msg):
 
 Two destinations. A shell or control message whose parent msg_id has a waiting future resolves it. Everything else goes to one app-supplied callback, `on_jmsg`. The name jmsg avoids collision with dialog messages. Solveit's `process_jmsg` is such a callback today. It reads the parent msg_id, splits at the dot, finds the cell, and folds the message into it.
 
-The channel guard matters, because the execute behind a `reply()` also causes iopub traffic parented to the same msg_id, and the busy status usually arrives before the reply. Only a shell or control message is a reply, so only those may resolve the future.
+The channel guard matters, because a shell request also causes iopub traffic parented to the same msg_id, and the busy status usually arrives before the reply. Only a shell or control message is a reply, so only those may resolve the future.
 
-The `done()` guard exists because `set_result` raises `InvalidStateError` on a future already cancelled by its timeout. A reply that arrives after its `reply()` timed out finds no entry, or finds a cancelled future, and flows to `on_jmsg` like any other unmatched message.
+The `done()` guard exists because `set_result` raises `InvalidStateError` on a future already cancelled by its timeout. A reply that arrives after its `request()` timed out finds no entry, or finds a cancelled future, and flows to `on_jmsg` like any other unmatched message.
 
 ## run()
 

@@ -52,27 +52,31 @@ async def alist(gen):
 
 
 async def test_reply_lifecycle():
-    "Replies correlate by parent id; iopub and late replies remain application traffic."
+    "A reply resolves after its reply and idle, in either order; its iopub traffic still reaches `on_jmsg`."
     kc = FakeClient()
     seen = _watch(kc)
-    w1, w2 = kc.reply('a'), kc.reply('b', msg_id='cell1.aa11')
-    first = kc.sent[0][0]
+    w1, w2, w3 = kc.reply('a'), kc.reply('b', msg_id='cell1.aa11'), kc.reply('c', allow_stdin=True)
+    first, third = kc.sent[0][0], kc.sent[2][0]
     assert kc.sent[1][0] == 'cell1.aa11'
+    assert kc.sent[0][2]['allow_stdin'] is False and kc.sent[2][2]['allow_stdin'] is True
 
-    kc.route(_msg('status', first, execution_state='busy'))
-    kc.route(_msg('stream', first, name='stdout', text='out'))
-    kc.route(_reply('cell1.aa11'))
+    for m in _outs(first, 'out'): kc.route(m)   # idle before reply
     kc.route(_reply(first))
-    r1, r2 = await w1, await w2
+    kc.route(_reply('cell1.aa11'))               # reply before idle
+    kc.route(_msg('status', 'cell1.aa11', execution_state='idle'))
+    kc.route(_reply(third))
+    kc.route(_msg('status', third, execution_state='idle'))
+    r1, r2, r3 = await w1, await w2, await w3
     assert r1['parent_header']['msg_id'] == first
     assert r2['parent_header']['msg_id'] == 'cell1.aa11'
-    assert [m['msg_type'] for m in seen] == ['status', 'stream', 'execute_reply', 'execute_reply']
-    assert not kc.replies
+    assert r3['parent_header']['msg_id'] == third
+    assert [m['msg_type'] for m in seen] == ['status', 'stream', 'status', 'execute_reply', 'execute_reply', 'status', 'execute_reply', 'status']
+    assert not kc.runs and not kc.replies
 
     w = kc.reply('slow', timeout=0.01)
     slow = kc.sent[-1][0]
     with pytest.raises(TimeoutError): await w
-    assert not kc.replies
+    assert slow not in kc.runs
     kc.route(_reply(slow))
     assert seen[-1]['msg_type'] == 'execute_reply'
 
