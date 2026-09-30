@@ -79,7 +79,7 @@ if asyncio.iscoroutine({vname}): {vname} = await {vname}
 '''
         else: code = f'{vname} = {func}'
         exprs = dict(__res=vname, __typ=f"type({vname}).__name__", __del=f"globals().pop('{vname}', None)")
-        kw2 = dict(user_expressions=exprs, timeout=timeout_, store_history=False)
+        kw2 = dict(user_expressions=exprs, timeout=timeout_, store_history=False, stop_on_error=False)
         if sidecar_: kw2['subshell_id'] = 'sidecar'
         if msg_id_ is not None: kw2['msg_id'] = msg_id_
         try: cts = (await self.reply(code, **kw2))['content']
