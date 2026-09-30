@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.13
+
+### Bugs Squashed
+
+- Do not halt kernel execution on error when evaluating ops expressions ([#16](https://github.com/AnswerDotAI/jupywire/issues/16))
+
+
 ## 0.1.12
 
 ### New Features
