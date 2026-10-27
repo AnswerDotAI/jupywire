@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.14
+
+### New Features
+
+- Fail waiters with ConnectionError on restart/`execution_lost`, add `default_timeout` to JmsgQueues, replace binary helpers with `to_frame`/`from_frame` ([#17](https://github.com/AnswerDotAI/jupywire/issues/17))
+
+
 ## 0.1.13
 
 ### Bugs Squashed
