@@ -6,7 +6,7 @@
 
 The package has four modules:
 
-- `jupywire.session` provides `Session` for constructing and HMAC-signing Jupyter messages. It serializes and deserializes frames and provides replay protection. The module also includes websocket JSON helpers (`dumps` and `loads`), binary helpers (`serialize_binary_message` and `deserialize_binary_message`), and `validate_string_dict`.
+- `jupywire.session` provides `Session` for constructing and HMAC-signing Jupyter messages. It serializes and deserializes frames and provides replay protection. `to_frame` and `from_frame` convert a message to and from a websocket frame: JSON text, or binary when the message carries buffers. They build on the module's JSON helpers, `dumps` and `loads`. The module also includes `validate_string_dict`.
 - `jupywire.connect` provides `write_connection_file`. It selects random free ports and writes a kernel connection file with permissions `0600`.
 - `jupywire.route` provides `RouterOps` for routing kernel-client messages and `JmsgQueues` for queue-based access to them.
 - `jupywire.ops` provides `EvalOps`, a mixin for evaluation and variable operations on kernel clients.
@@ -26,6 +26,8 @@ pip install jupywire
 - `exec_outs` collects the results from `run` and returns a list of rendered results.
 
 `run` uses each return value from `on_stdin` to send an `input_reply` with the correct parent. `allow_stdin` defaults to whether an `on_stdin` hook is present. Pass `allow_stdin=True` without a hook to handle prompts through the application's `on_jmsg` callback.
+
+Gateway `restarting` and `execution_lost` notifications end pending replies and runs with `ConnectionError`. They do not call `on_dead`. Actual kernel death ends them with `DeadKernelError` and calls `on_dead`.
 
 Every inbound message also goes once to the application's `on_jmsg` callback, in receive order, after request routing. This includes collected run messages and stdin handled by a run callback. Receiving a notification does not transfer ownership of that stdin exchange. Keep the handler a cheap dispatcher; an awaitable return blocks the transport reader until it completes. Use `JmsgQueues` to pull the same messages from queues.
 

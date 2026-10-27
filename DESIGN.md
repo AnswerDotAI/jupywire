@@ -4,6 +4,8 @@ Agreed 2026-08-23. This is the target design for `jupywire.route` and its two cl
 
 Updated 2026-09-13: `on_jmsg` observes every inbound message once, after routing to its request owner. The intermediate routing sketches below build up request ownership; the final routing section adds the shared notification path.
 
+Updated 2026-10-26: gateway `restarting` and `execution_lost` notifications call `fail_waiters(ConnectionError(...))`. They still reach `on_jmsg` once and never call `on_dead`. Websocket gaps fail old waits and discard queued frames before reconnecting; no frame is automatically resent. The older sketches below explain request routing, not the current reconnect contract.
+
 ## The wire
 
 A kernel and its client exchange messages on four channels. shell carries requests and their replies. control carries requests that must not queue behind shell. iopub is a broadcast of everything the kernel does while it works. stdin carries the kernel's questions to the user.
@@ -251,6 +253,8 @@ Some consumers pull rather than accept calls. ipymini's protocol tests await the
 qs = JmsgQueues(kc, merge=dict(iopub='jmsg', stdin='jmsg'))
 msg = await qs.get('jmsg')
 ```
+
+A wait that passes no `timeout` uses the client's `default_timeout`, as `reply`, `request` and `run` do. Its default, `None`, waits forever.
 
 Neither push nor pull is primary, and no client attaches `JmsgQueues` by default. `route()` knows only `on_jmsg`. Today's client-level accessors (`get_iopub_msg`, `get_shell_msg`, `get_stdin_msg`, `get_control_msg`, `get_jmsg`, `jmsg_for`) leave the clients and become `JmsgQueues` methods. `jmsg_flush` has no replacement, because with no `JmsgQueues` attached nothing accumulates to flush. conkernelclient's `iopub_drain` remains, rewritten over an attached `JmsgQueues`, because ipymini's protocol tests drain requests they already sent without a `run()`.
 

@@ -190,7 +190,8 @@ async def test_application_routing_story():
     assert (await qs.get('jmsg', timeout=1))['content']['execution_state'] == 'idle'
     assert len(await alist(run)) == 3
     kc.route(_msg('ignored', 'foreign', 'unknown'))
-    with pytest.raises(Empty): await qs.get('jmsg', timeout=0)
+    kc.default_timeout = 0
+    with pytest.raises(Empty): await qs.get('jmsg')
 
 
 async def test_protocol_requests_story():

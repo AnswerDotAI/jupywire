@@ -7,8 +7,9 @@ HMAC signature, header/parent/metadata/content JSON, raw buffer frames), same re
 ("Duplicate Signature"), same error strings. Deliberate simplifications, none of which change
 bytes on the wire: header dates stay ISO-8601 strings on deserialize (jupyter_client converts
 them to datetimes client-side); no v4-protocol adaptation (our kernels speak 5.3 only); no fork
-guard. Socket-facing `send`/`recv` live with the transports (kernmini's `MiniSession` subclass);
-the websocket JSON/binary helpers below are the frame layer jupygate's channel protocol uses.
+guard. Socket-facing `send`/`recv` live with the transports (kernmini's `MiniSession` subclass).
+
+`to_frame` and `from_frame` convert between a message dict and a frame of the Jupyter websocket protocol that jupygate and rustygate serve. A message with buffers travels as a binary frame, and any other message as a JSON text frame.
 """
 
 import hashlib, hmac, json, os, struct, uuid
@@ -147,32 +148,23 @@ def loads(s: str):
     return msg
 
 
-def pack_frames(body:bytes, buffers=())->bytes:
-    "Pack `body` and binary `buffers` into a legacy Jupyter websocket binary frame"
-    parts = [body, *(bytes(b) for b in buffers)]
+def to_frame(msg:dict)->str|bytes:
+    "Encode `msg` for a websocket: a JSON text frame, or a binary frame when it carries buffers"
+    body = dumps({k:v for k,v in msg.items() if k != "buffers"})
+    if not msg.get("buffers"): return body
+    parts = [body.encode("utf8"), *(bytes(b) for b in msg["buffers"])]
     offs = [4*(len(parts)+1)]
     for p in parts[:-1]: offs.append(offs[-1]+len(p))
     return b''.join([struct.pack(f'!{len(parts)+1}I', len(parts), *offs), *parts])
 
-def unpack_frames(bmsg:bytes)->tuple:
-    "Split a legacy Jupyter websocket binary frame into `(body, buffers)`"
-    n = struct.unpack('!I', bmsg[:4])[0]
-    offs = [*struct.unpack(f'!{n}I', bmsg[4:4*(n+1)]), None]
-    parts = [bmsg[a:b] for a,b in zip(offs[:-1], offs[1:])]
-    return parts[0], parts[1:]
 
-
-def serialize_binary_message(msg):
-    msg = msg.copy()
-    buffers = msg.pop("buffers")
-    return pack_frames(dumps(msg).encode("utf8"), buffers)
-
-
-def deserialize_binary_message(bmsg: bytes):
-    body, bufs = unpack_frames(bmsg)
-    msg = loads(body.decode("utf8"))
-    msg["buffers"] = [memoryview(b) for b in bufs]
-    return msg
+def from_frame(data:str|bytes)->dict:
+    "Decode a websocket frame into a message dict; `buffers` is always present, as `memoryview`s"
+    if not isinstance(data, (bytes, bytearray)): return {"buffers": [], **loads(data)}
+    n = struct.unpack('!I', data[:4])[0]
+    offs = [*struct.unpack(f'!{n}I', data[4:4*(n+1)]), None]
+    body, *bufs = [data[a:b] for a,b in zip(offs[:-1], offs[1:])]
+    return {**loads(body.decode("utf8")), "buffers": [memoryview(b) for b in bufs]}
 
 
 def validate_string_dict(dct: dict[str, str]) -> None:

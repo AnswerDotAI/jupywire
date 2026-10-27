@@ -12,8 +12,8 @@ and resolves once the request's idle status has been routed. `exec_outs` keeps a
 `run` infers stdin permission from `on_stdin` unless `allow_stdin` is explicit.
 `request` sends any named protocol request, `shell` and `control` name its channel, and the typed
 verbs (`complete`, `inspect`, `check`, `history`) sit on top. `input` answers an explicit
-`input_request`, or the most recent unmatched request that `route` remembers. A dead-kernel status fails every waiter through
-`_kernel_died`, which then calls the app's `on_dead(msg)` hook if set; transport-loss and close paths call `fail_waiters` directly. `JmsgQueues` is the
+`input_request`, or the most recent unmatched request that `route` remembers. Restart and `execution_lost` notifications fail waiters with `ConnectionError`.
+A dead-kernel status fails waiters through `_kernel_died`, which calls `on_dead(msg)` if set. Transport-loss and close paths call `fail_waiters` directly. `JmsgQueues` is the
 pull adapter: it registers itself as `on_jmsg` (and `kc.jmsgq`) and serves per-channel queues.
 
 The inheritor supplies `execute(code, msg_id=, ...)` sending without awaiting, `send(msg, channel)`
@@ -37,6 +37,7 @@ _END = object()   # closes a run's message stream
 
 class RouterOps:
     "Message handling over a transport that calls `route(msg)`: `reply()`, `run()`, named requests, stdin, and death."
+    default_timeout = None # Seconds to wait when a call passes no `timeout`; None waits forever
     def _init_router(self):
         self.replies = {}    # msg_id -> future resolved with the matching shell/control reply
         self.runs = {}       # msg_id -> run state
@@ -53,6 +54,8 @@ class RouterOps:
 
     def _route(self, msg):
         if msg['msg_type'] == 'status' and msg.get('content', {}).get('execution_state') == 'dead': return self._kernel_died(msg)
+        if msg['msg_type'] == 'execution_lost' or msg['msg_type'] == 'status' and msg.get('content', {}).get('execution_state') == 'restarting':
+            return self.fail_waiters(ConnectionError(msg.get('content', {}).get('error', 'kernel restarting')))
         parent = msg.get('parent_header', {}).get('msg_id')
         if msg.get('channel') == 'stdin':
             self._last_stdin_req = msg.get('header')
@@ -108,8 +111,8 @@ class RouterOps:
     def new_msg_id(self): return self.session.msg_id
 
     def _filed(self, mid, timeout=None):
-        "File a reply future for `mid` and return its awaitable; file before sending, so no reply can slip past. A None `timeout` falls back to the client's `default_timeout` attribute, when set."
-        if timeout is None: timeout = getattr(self, 'default_timeout', None)
+        "File a reply future for `mid` and return its awaitable; file before sending, so no reply can slip past. A None `timeout` falls back to the client's `default_timeout`."
+        if timeout is None: timeout = self.default_timeout
         fut = self.replies[mid] = asyncio.get_running_loop().create_future()
         async def _wait():
             try: return await asyncio.wait_for(fut, timeout)
@@ -156,7 +159,7 @@ class RouterOps:
         "Async generator of every message parented to this execute, up to and including its `execute_reply` and idle status; the send happens now."
         mid = msg_id or self.new_msg_id()
         if allow_stdin is None: allow_stdin = on_stdin is not None
-        if timeout is None: timeout = getattr(self, 'default_timeout', None)
+        if timeout is None: timeout = self.default_timeout
         end = None if timeout is None else asyncio.get_running_loop().time() + timeout
         r = self.runs[mid] = dict2obj(mid=mid, q=asyncio.Queue(), got_reply=False, got_idle=False, on_stdin=on_stdin,
             stdin_tasks=set(), error=None, stdin_context=contextvars.copy_context() if on_stdin else None)
@@ -226,13 +229,14 @@ class RouterOps:
 
 
 class JmsgQueues:
-    "Pull adapter over `on_jmsg`: one queue per name, with `merge` folding channels together; attaches itself as `kc.on_jmsg` and `kc.jmsgq`."
+    "Pull adapter over `on_jmsg`: one queue per name, with `merge` folding channels together; attaches itself as `kc.on_jmsg` and `kc.jmsgq`. Waits that pass no `timeout` use the client's `default_timeout`."
     def __init__(self, kc,
         queues=('shell', 'control', 'iopub', 'stdin'), # Queue names; a message whose channel maps to no queue is dropped
         merge=None, # Channel-to-queue aliases, e.g. `dict(iopub='jmsg', stdin='jmsg')`
     ):
         self.queues = {k: asyncio.Queue() for k in queues}
         self.merge = merge or {}
+        self.kc = kc
         kc.on_jmsg = self
         kc.jmsgq = self
 
@@ -242,9 +246,7 @@ class JmsgQueues:
 
     async def get(self, queue, timeout=None):
         "Next message on `queue`, raising `queue.Empty` on timeout."
-        try:
-            async with asyncio.timeout(timeout): return await self.queues[queue].get()
-        except asyncio.TimeoutError as e: raise Empty from e
+        return await self.jmsg_for(queue=queue, timeout=timeout)
 
     async def get_shell_msg(self, timeout=None): return await self.get('shell', timeout)
     async def get_iopub_msg(self, timeout=None): return await self.get('iopub', timeout)
@@ -254,6 +256,7 @@ class JmsgQueues:
 
     async def jmsg_for(self, *msg_types, pred=None, queue='jmsg', timeout=None):
         "The next message on `queue` matching the given types (and `pred`), raising `queue.Empty` on timeout; non-matching messages are discarded."
+        if timeout is None: timeout = self.kc.default_timeout
         try:
             async with asyncio.timeout(timeout):
                 while True:

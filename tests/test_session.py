@@ -6,7 +6,7 @@ import pytest
 from jupyter_client import BlockingKernelClient
 from jupyter_client.session import Session as JCSession
 
-from jupywire.session import Session, serialize_binary_message, deserialize_binary_message, dumps, loads, DELIM
+from jupywire.session import Session, to_frame, from_frame, DELIM
 from jupywire.connect import write_connection_file
 
 
@@ -38,17 +38,18 @@ def test_authenticated_exchange_story():
 
 
 def test_websocket_framing_story():
-    "JSON revives header dates; binary framing preserves a separate body and each opaque buffer."
+    "A text frame revives header dates; a message with buffers becomes a binary frame that keeps the body and each opaque buffer separate."
     session = Session()
     msg = session.msg('display_data', dict(data={'text/plain': 'hi'}), parent=session.msg('execute_request'))
-    assert loads(dumps(msg)) == msg
+    text = to_frame(msg)
+    assert isinstance(text, str) and from_frame(text) == dict(msg, buffers=[])
     msg['buffers'] = [b'first', b'\0\xffsecond']
-    frame = serialize_binary_message(msg)
+    frame = to_frame(msg)
     count, start, first, second = struct.unpack('!4I', frame[:16])
     assert (count, start) == (3, 16)
     assert json.loads(frame[start:first])['content'] == msg['content']
     assert [frame[first:second], frame[second:]] == msg['buffers']
-    received = deserialize_binary_message(frame)
+    received = from_frame(frame)
     assert received['header'] == msg['header'] and received['parent_header'] == msg['parent_header']
     assert received['content'] == msg['content'] and [bytes(b) for b in received['buffers']] == msg['buffers']
 
