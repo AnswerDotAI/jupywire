@@ -128,7 +128,7 @@ class RouterOps:
             raise
         return w
 
-    def reply(self, code, timeout=None, msg_id=None, **kw):
+    def reply(self, code='', timeout=None, msg_id=None, **kw):
         "Run `code`, returning an awaitable of its `execute_reply`; the send happens now, and the awaitable resolves once the request's idle status has been routed"
         gen = self.run(code, timeout=timeout, msg_id=msg_id, **kw)
         async def _wait():
@@ -155,7 +155,7 @@ class RouterOps:
         "Send a named control request, e.g. `control('interrupt_request')`."
         return self.request(name, content, 'control', timeout=timeout)
 
-    def run(self, code, on_stdin=None, timeout=None, msg_id=None, allow_stdin=None, **kw):
+    def run(self, code='', on_stdin=None, timeout=None, msg_id=None, allow_stdin=None, **kw):
         "Async generator of every message parented to this execute, up to and including its `execute_reply` and idle status; the send happens now."
         mid = msg_id or self.new_msg_id()
         if allow_stdin is None: allow_stdin = on_stdin is not None
@@ -181,7 +181,7 @@ class RouterOps:
             self.runs.pop(r.mid, None)
             for task in r.stdin_tasks: task.cancel()
 
-    async def exec_outs(self, code, **kw):
+    async def exec_outs(self, code='', **kw):
         "Just the rendered nbformat outputs of running `code`."
         return [msg2out(m) async for m in self.run(code, **kw) if m['msg_type'] in OUTPUT_MSGS]
 
