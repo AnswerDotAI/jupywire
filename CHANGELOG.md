@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.15
+
+### New Features
+
+- Default code to empty string in reply, run, and `exec_outs` ([#18](https://github.com/AnswerDotAI/jupywire/issues/18))
+
+
 ## 0.1.14
 
 ### New Features
